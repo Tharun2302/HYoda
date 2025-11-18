@@ -244,10 +244,25 @@ def chat_stream():
                         import traceback
                         traceback.print_exc()
                 
-                # Send done signal with trace_id and generation_id
+                # Prepare tree branch info for frontend
+                tree_branch_info = {}
+                if rag_question_info:
+                    tree_branch_info = {
+                        'tree_branch': rag_question_info.get('tree_path', 'Unknown'),
+                        'tags': rag_question_info.get('tags', []),
+                        'rag_question': rag_question_info.get('question', 'N/A')
+                    }
+                else:
+                    tree_branch_info = {
+                        'tree_branch': 'No RAG question found (using general system prompt)',
+                        'tags': [],
+                        'rag_question': None
+                    }
+                
+                # Send done signal with trace_id, generation_id, and tree branch info
                 final_trace_id = trace_id if trace_id else f'trace_{int(time.time())}'
                 print(f"[LANGFUSE] Sending trace_id to frontend: {final_trace_id}, generation_id: {generation_id}")
-                yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'trace_id': final_trace_id, 'generation_id': generation_id})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'trace_id': final_trace_id, 'generation_id': generation_id, 'tree_branch_info': tree_branch_info})}\n\n"
                 
             except Exception as e:
                 error_msg = f"Error calling OpenAI API: {str(e)}"

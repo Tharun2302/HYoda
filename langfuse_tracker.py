@@ -20,6 +20,10 @@ from typing import Optional, Dict, Any
 from langfuse import Langfuse
 import os
 import time
+from dotenv import load_dotenv
+
+# Load environment variables from .env file FIRST
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION - Load from environment variables

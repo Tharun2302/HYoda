@@ -1,20 +1,57 @@
 """
 RAG System for HealthYoda Question Book
-Extracts questions and answers from the .docx file and provides retrieval capabilities
+Extracts questions and answers from the .docx file and provides semantic retrieval using vector database
 """
 import docx
 import os
 from typing import List, Dict, Optional, Tuple
 import json
 
+try:
+    import chromadb
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    print("⚠️  ChromaDB not installed - vector database features disabled")
+
 class QuestionBookRAG:
     """RAG system for retrieving relevant questions from the Question Book"""
     
-    def __init__(self, docx_path: str = 'docx/Question BOOK.docx'):
+    def __init__(self, docx_path: str = 'docx/Question BOOK.docx', openai_client=None):
         self.docx_path = docx_path
         self.questions = []
         self.sections = []
+        self.openai_client = openai_client
+        
+        # Initialize ChromaDB for vector storage (if available)
+        self.chroma_client = None
+        self.collection = None
+        
+        if CHROMADB_AVAILABLE:
+            try:
+                # Use new ChromaDB client API (no deprecated Settings)
+                self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+                
+                # Create or get collection
+                self.collection = self.chroma_client.get_or_create_collection(
+                    name="question_book",
+                    metadata={"description": "HealthYoda Question Book embeddings"}
+                )
+            except Exception as e:
+                print(f"⚠️  ChromaDB initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
+                self.chroma_client = None
+                self.collection = None
+        
+        # Load document and create embeddings
         self.load_document()
+        
+        # Check if rebuild is requested via environment variable
+        rebuild_vectorstore = os.getenv('REBUILD_VECTORSTORE', 'false').lower() == 'true'
+        
+        if self.collection:
+            self.create_embeddings(force_rebuild=rebuild_vectorstore)
     
     def load_document(self):
         """Load and parse the .docx document"""
@@ -28,70 +65,87 @@ class QuestionBookRAG:
         current_question = None
         current_answers = []
         
+        # Categories that indicate question sections
+        categories = ['Chief Complaint', 'Onset/Duration', 'Quality/Severity', 
+                     'Aggravating/Relieving', 'Associated Symptoms', 'Red Flags', 
+                     'ROS', 'Context']
+        
+        # Exclude patterns
+        exclude_patterns = ['Table of Contents', 'HealthYoda History-Taking Handbook', 
+                           'comprehensive system-wise', 'A comprehensive', '[page]']
+        
         for i, para in enumerate(doc.paragraphs):
             text = para.text.strip()
             
             if not text:
                 continue
             
-            # Detect system headers
-            if any(system in text for system in ['Cardiac System', 'Respiratory System', 'GI System', 
-                                                 'Neurologic System', 'Musculoskeletal System', 'GU System',
-                                                 'Dermatologic System', 'Endocrine', 'ENT Eye System']):
-                if 'System' in text and len(text) < 100:
-                    current_system = text
+            # Skip excluded patterns
+            if any(pattern in text for pattern in exclude_patterns):
+                continue
+            
+            # Detect system headers - look for "HealthYoda History Framework" pattern
+            if 'HealthYoda History Framework' in text:
+                # Extract system name - it comes after the framework text
+                if 'Cardiac' in text:
+                    current_system = 'Cardiac System'
+                elif 'Respiratory' in text:
+                    current_system = 'Respiratory System'
+                elif 'GI System' in text or ('GI' in text and 'System' in text):
+                    current_system = 'GI System'
+                elif 'Neurologic' in text:
+                    current_system = 'Neurologic System'
+                elif 'Musculoskeletal' in text:
+                    current_system = 'Musculoskeletal System'
+                elif 'GU System' in text or ('GU' in text and 'System' in text):
+                    current_system = 'GU System'
+                elif 'Dermatologic' in text:
+                    current_system = 'Dermatologic System'
+                elif 'Endocrine' in text or 'General' in text:
+                    current_system = 'General/Endocrine/Infectious Disease System'
+                elif 'ENT' in text or 'Eye' in text:
+                    current_system = 'ENT/Eye System'
+                
+                if current_system:
                     current_symptom = None
                     current_category = None
+                    current_question = None
+                    current_answers = []
             
-            # Detect symptom/complaint headers (usually bold or standalone lines)
-            elif text and not text.startswith('Q:') and not text.startswith('Possible') and \
+            # Detect symptom/complaint headers - standalone lines that aren't categories or questions
+            elif current_system and text not in categories and \
+                 not text.startswith('Q') and not text.startswith('Possible') and \
                  not text.startswith('-') and len(text) < 100 and \
-                 text not in ['Chief Complaint', 'Onset/Duration', 'Quality/Severity', 
-                             'Aggravating/Relieving', 'Associated Symptoms', 'Red Flags', 
-                             'ROS', 'Context', 'Table of Contents']:
-                # Likely a symptom/complaint name
-                if current_system and text != current_system:
-                    current_symptom = text
-                    current_category = None
+                 text != current_system and 'System' not in text and \
+                 'HealthYoda' not in text and text != 'Wrap-up':
+                # This is likely a symptom/complaint name
+                # Save previous question before changing symptom
+                if current_question and current_system:
+                    self._save_question(current_system, current_symptom, current_category,
+                                      current_question, current_answers.copy(), i)
+                    current_question = None
+                    current_answers = []
+                
+                current_symptom = text
+                current_category = None
             
             # Detect category headers
-            elif text in ['Chief Complaint', 'Onset/Duration', 'Quality/Severity', 
-                         'Aggravating/Relieving', 'Associated Symptoms', 'Red Flags', 
-                         'ROS', 'Context']:
+            elif text in categories:
+                # Save previous question before changing category
+                if current_question and current_system:
+                    self._save_question(current_system, current_symptom, current_category,
+                                      current_question, current_answers.copy(), i)
+                    current_question = None
+                    current_answers = []
+                
                 current_category = text
-                current_question = None
-                current_answers = []
             
-            # Detect questions
+            # Detect questions - lines starting with Q: or Q.
             elif text.startswith('Q:') or text.startswith('Q.'):
                 # Save previous question if exists
                 if current_question and current_system:
-                    # Create tags for tracking
-                    tags = []
-                    if current_system:
-                        tags.append(f"system:{current_system}")
-                    if current_symptom:
-                        tags.append(f"symptom:{current_symptom}")
-                    if current_category:
-                        tags.append(f"category:{current_category}")
-                    
-                    # Create question tree path
-                    tree_path = " > ".join(filter(None, [
-                        current_system,
-                        current_symptom,
-                        current_category
-                    ]))
-                    
-                    self.questions.append({
-                        'system': current_system,
-                        'symptom': current_symptom,
-                        'category': current_category,
-                        'question': current_question,
-                        'possible_answers': current_answers.copy(),
-                        'line_number': i,
-                        'tags': tags,
-                        'tree_path': tree_path
-                    })
+                    self._save_question(current_system, current_symptom, current_category,
+                                      current_question, current_answers.copy(), i)
                 
                 current_question = text.replace('Q:', '').replace('Q.', '').strip()
                 current_answers = []
@@ -107,32 +161,128 @@ class QuestionBookRAG:
         
         # Save last question
         if current_question and current_system:
-            tags = []
-            if current_system:
-                tags.append(f"system:{current_system}")
-            if current_symptom:
-                tags.append(f"symptom:{current_symptom}")
-            if current_category:
-                tags.append(f"category:{current_category}")
+            self._save_question(current_system, current_symptom, current_category,
+                              current_question, current_answers.copy(), len(doc.paragraphs))
+        
+        systems_found = len(set(q['system'] for q in self.questions if q.get('system')))
+        print(f"Loaded {len(self.questions)} questions from {systems_found} systems")
+    
+    def _save_question(self, system, symptom, category, question, answers, line_number):
+        """Helper method to save a question with tags"""
+        tags = []
+        if system:
+            tags.append(f"system:{system}")
+        if symptom:
+            tags.append(f"symptom:{symptom}")
+        if category:
+            tags.append(f"category:{category}")
+        
+        tree_path = " > ".join(filter(None, [system, symptom, category]))
+        
+        self.questions.append({
+            'system': system,
+            'symptom': symptom,
+            'category': category,
+            'question': question,
+            'possible_answers': answers,
+            'line_number': line_number,
+            'tags': tags,
+            'tree_path': tree_path
+        })
+    
+    def create_embeddings(self, force_rebuild: bool = False):
+        """
+        Create embeddings for all questions and store in vector database
+        
+        Args:
+            force_rebuild: If True, rebuild embeddings even if they exist
+        """
+        if not self.collection:
+            print("⚠️  Vector database not available - skipping embeddings. Using keyword search only.")
+            return
             
-            tree_path = " > ".join(filter(None, [
-                current_system,
-                current_symptom,
-                current_category
-            ]))
+        if not self.openai_client:
+            print("⚠️  OpenAI client not available - skipping embeddings. Using keyword search only.")
+            return
+        
+        # Check if collection already has data (unless force rebuild)
+        if not force_rebuild and self.collection.count() > 0:
+            print(f"✅ Vector database already has {self.collection.count()} embeddings")
+            print(f"   Set REBUILD_VECTORSTORE=true in .env to rebuild")
+            return
+        
+        if force_rebuild and self.collection.count() > 0:
+            print(f"🔄 Rebuilding vector database (current: {self.collection.count()} embeddings)...")
+            # Delete existing collection and recreate
+            self.chroma_client.delete_collection(name="question_book")
+            self.collection = self.chroma_client.create_collection(
+                name="question_book",
+                metadata={"description": "HealthYoda Question Book embeddings"}
+            )
+        
+        print(f"Creating embeddings for {len(self.questions)} questions...")
+        
+        # Create text for embedding (combine question + context)
+        texts_to_embed = []
+        ids = []
+        metadatas = []
+        
+        for idx, q in enumerate(self.questions):
+            # Create rich text for embedding: question + system + symptom + category + answers
+            text_parts = []
+            if q.get('question'):
+                text_parts.append(q['question'])
+            if q.get('system'):
+                text_parts.append(f"System: {q['system']}")
+            if q.get('symptom'):
+                text_parts.append(f"Symptom: {q['symptom']}")
+            if q.get('category'):
+                text_parts.append(f"Category: {q['category']}")
+            if q.get('possible_answers'):
+                text_parts.append(f"Possible answers: {', '.join(q['possible_answers'][:5])}")
             
-            self.questions.append({
-                'system': current_system,
-                'symptom': current_symptom,
-                'category': current_category,
-                'question': current_question,
-                'possible_answers': current_answers.copy(),
-                'line_number': len(doc.paragraphs),
-                'tags': tags,
-                'tree_path': tree_path
+            full_text = " | ".join(text_parts)
+            texts_to_embed.append(full_text)
+            ids.append(f"q_{idx}")
+            metadatas.append({
+                'system': q.get('system', ''),
+                'symptom': q.get('symptom', ''),
+                'category': q.get('category', ''),
+                'question': q.get('question', ''),
+                'tree_path': q.get('tree_path', ''),
+                'index': idx
             })
         
-        print(f"Loaded {len(self.questions)} questions from {len(set(q['system'] for q in self.questions))} systems")
+        # Create embeddings in batches
+        batch_size = 100
+        for i in range(0, len(texts_to_embed), batch_size):
+            batch_texts = texts_to_embed[i:i+batch_size]
+            batch_ids = ids[i:i+batch_size]
+            batch_metadatas = metadatas[i:i+batch_size]
+            
+            try:
+                # Get embeddings from OpenAI
+                response = self.openai_client.embeddings.create(
+                    model="text-embedding-3-small",  # Cost-effective embedding model
+                    input=batch_texts
+                )
+                
+                embeddings = [item.embedding for item in response.data]
+                
+                # Add to ChromaDB
+                self.collection.add(
+                    embeddings=embeddings,
+                    documents=batch_texts,
+                    ids=batch_ids,
+                    metadatas=batch_metadatas
+                )
+                
+                print(f"  Processed {min(i+batch_size, len(texts_to_embed))}/{len(texts_to_embed)} questions...")
+            except Exception as e:
+                print(f"  Error creating embeddings for batch {i}: {e}")
+                continue
+        
+        print(f"✅ Created {self.collection.count()} embeddings in vector database")
     
     def search_by_system(self, system_name: str) -> List[Dict]:
         """Retrieve all questions for a specific system"""
@@ -164,11 +314,60 @@ class QuestionBookRAG:
         return results
     
     def get_next_question(self, conversation_context: str, current_category: Optional[str] = None,
-                         symptom: Optional[str] = None, system: Optional[str] = None) -> Optional[Dict]:
+                         symptom: Optional[str] = None, system: Optional[str] = None, 
+                         use_semantic_search: bool = True) -> Optional[Dict]:
         """
         Get the next relevant question based on conversation context
+        Uses semantic search (vector DB) if available, otherwise falls back to keyword search
         Returns question with tags and tree_path for logging
         """
+        # Try semantic search first if embeddings are available
+        if use_semantic_search and self.openai_client and self.collection and self.collection.count() > 0:
+            try:
+                # Create embedding for the conversation context
+                response = self.openai_client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=conversation_context
+                )
+                query_embedding = response.data[0].embedding
+                
+                # Build where clause for filtering (ChromaDB syntax)
+                where_clause = None
+                if system or symptom or current_category:
+                    where_clause = {}
+                    if system:
+                        # Find questions matching system name
+                        where_clause['system'] = {'$contains': system}
+                    if symptom:
+                        where_clause['symptom'] = {'$contains': symptom}
+                    if current_category:
+                        where_clause['category'] = current_category
+                
+                # Query vector database
+                query_kwargs = {
+                    'query_embeddings': [query_embedding],
+                    'n_results': 5  # Get top 5 most similar
+                }
+                if where_clause:
+                    query_kwargs['where'] = where_clause
+                
+                results = self.collection.query(**query_kwargs)
+                
+                if results['ids'] and len(results['ids'][0]) > 0:
+                    # Get the most relevant question
+                    top_result_idx = int(results['ids'][0][0].replace('q_', ''))
+                    question = self.questions[top_result_idx].copy()
+                    
+                    # Log semantic search results
+                    print(f"[RAG] Semantic search found {len(results['ids'][0])} relevant questions")
+                    if results.get('distances'):
+                        print(f"[RAG] Top match similarity score: {results['distances'][0][0]:.4f}")
+                    
+                    return question
+            except Exception as e:
+                print(f"[RAG] Semantic search failed: {e}, falling back to keyword search")
+        
+        # Fallback to keyword-based search
         context_lower = conversation_context.lower()
         
         # Determine which system/symptom we're discussing

@@ -30,13 +30,30 @@ else:
 # Langfuse tracker is initialized in langfuse_tracker.py module
 langfuse = langfuse_tracker.client
 
-# Initialize RAG system for Question Book
-try:
-    rag_system = QuestionBookRAG('docx/Question BOOK.docx')
-    print(f"✅ RAG System loaded: {len(rag_system.questions)} questions available")
-except Exception as e:
-    print(f"⚠️  Warning: Could not load RAG system: {e}")
-    rag_system = None
+# Initialize RAG system for Question Book with OpenAI client for embeddings
+# Skip initialization in Flask reloader process (only initialize once in main process)
+rag_system = None
+
+def initialize_rag_system():
+    """Initialize RAG system (called once, not on reload)"""
+    global rag_system
+    if rag_system is None:
+        try:
+            rag_system = QuestionBookRAG('docx/Question BOOK.docx', openai_client=client)
+            print(f"✅ RAG System loaded: {len(rag_system.questions)} questions available")
+            if rag_system.collection and rag_system.collection.count() > 0:
+                print(f"✅ Vector database ready: {rag_system.collection.count()} embeddings available")
+            elif rag_system.collection:
+                print(f"ℹ️  Vector database initialized (no embeddings yet)")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load RAG system: {e}")
+            import traceback
+            traceback.print_exc()
+            rag_system = None
+
+# Initialize RAG system (no need for complex process detection since debug=False)
+# With debug=False, Flask runs in a single process, so initialization happens once
+initialize_rag_system()
 
 # Simple in-memory conversation history
 conversations = {}
@@ -48,6 +65,10 @@ SYSTEM_PROMPT = """Medical Intake Voice Agent (Improved)## Role & Objective ,You
 def chat_stream():
     """Streaming chat endpoint using OpenAI"""
     try:
+        # Ensure RAG system is initialized (lazy initialization)
+        if rag_system is None:
+            initialize_rag_system()
+        
         if not client:
             error_msg = "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
             def error_response():
@@ -174,10 +195,23 @@ def chat_stream():
                 # Add assistant response to history
                 conversation_history.append({'role': 'assistant', 'content': full_response})
                 
-                # Log RAG usage if question was retrieved
+                # Log tree branch for EVERY chatbot response
+                print(f"\n{'='*80}")
+                print(f"[CHATBOT RESPONSE]")
+                print(f"{'='*80}")
                 if rag_question_info:
-                    print(f"[RAG] Used question from branch: {rag_question_info.get('tree_path', 'Unknown')}")
-                    print(f"[RAG] Response generated using: {rag_question_info.get('question', 'N/A')[:100]}...")
+                    tree_path = rag_question_info.get('tree_path', 'Unknown')
+                    tags = rag_question_info.get('tags', [])
+                    print(f"[TREE BRANCH] {tree_path}")
+                    print(f"[TAGS] {', '.join(tags) if tags else 'None'}")
+                    print(f"[RAG QUESTION] {rag_question_info.get('question', 'N/A')[:100]}...")
+                else:
+                    print(f"[TREE BRANCH] No RAG question found (using general system prompt)")
+                    print(f"[TAGS] None")
+                    print(f"[RAG QUESTION] None")
+                print(f"[USER] {question[:100]}...")
+                print(f"[BOT] {full_response[:150]}...")
+                print(f"{'='*80}\n")
                 
                 # Update Langfuse generation with the complete response
                 generation_id = None
@@ -300,25 +334,31 @@ def health_check():
     return jsonify({'status': 'healthy'})
 
 if __name__ == '__main__':
-    print("Starting HealthYoda chatbot server...")
-    print("Server will run on http://127.0.0.1:8002")
-    print("-" * 50)
+    # Only print startup messages once (not on reload)
+    # RAG system is initialized above based on process detection
     
-    if not openai_api_key:
-        print("\n⚠️  WARNING: OPENAI_API_KEY not set!")
-        print("Set it using: export OPENAI_API_KEY='your-api-key'")
-        print("Or create a .env file with OPENAI_API_KEY=your-api-key")
-        print("The chatbot will not work without an API key.\n")
-    else:
-        print("✅ OpenAI API key found!")
+    if not hasattr(app, '_startup_printed'):
+        print("Starting HealthYoda chatbot server...")
+        print("Server will run on http://127.0.0.1:8002")
+        print("-" * 50)
+        
+        if not openai_api_key:
+            print("\n⚠️  WARNING: OPENAI_API_KEY not set!")
+            print("Set it using: export OPENAI_API_KEY='your-api-key'")
+            print("Or create a .env file with OPENAI_API_KEY=your-api-key")
+            print("The chatbot will not work without an API key.\n")
+        else:
+            print("✅ OpenAI API key found!")
+        
+        if not langfuse:
+            print("⚠️  Langfuse keys not found. Traces will not be logged.")
+            print("Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST in .env")
+        else:
+            print("✅ Langfuse configured! Traces will be logged.")
+            print(f"   Using Langfuse tracker module for observability")
+        
+        print("-" * 50)
+        app._startup_printed = True
     
-    if not langfuse:
-        print("⚠️  Langfuse keys not found. Traces will not be logged.")
-        print("Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST in .env")
-    else:
-        print("✅ Langfuse configured! Traces will be logged.")
-        print(f"   Using Langfuse tracker module for observability")
-    
-    print("-" * 50)
-    app.run(host='127.0.0.1', port=8002, debug=True)
+    app.run(host='127.0.0.1', port=8002, debug=False)
 

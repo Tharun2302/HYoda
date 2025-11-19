@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from functools import wraps
 import json
 import time
 import os
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
 from langfuse_tracker import langfuse_tracker
@@ -12,7 +14,22 @@ from rag_system import QuestionBookRAG
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# HIPAA Compliance: Restrict CORS to specific origins only
+# In production, replace with actual frontend domain(s)
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000').split(',')
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# HIPAA Compliance: Add security headers
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    return response
 
 # Initialize OpenAI client
 openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -58,13 +75,268 @@ initialize_rag_system()
 # Simple in-memory conversation history
 conversations = {}
 
+# HIPAA Compliance: Rate limiting (simple in-memory implementation)
+# In production, use Redis or similar for distributed rate limiting
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+rate_limit_store = defaultdict(list)  # IP -> list of request timestamps
+RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', '100'))  # requests per window
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '3600'))  # seconds (1 hour)
+
+def check_rate_limit(ip_address):
+    """Check if IP address has exceeded rate limit"""
+    now = datetime.now()
+    window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW)
+    
+    # Clean old entries
+    rate_limit_store[ip_address] = [
+        ts for ts in rate_limit_store[ip_address] 
+        if ts > window_start
+    ]
+    
+    # Check limit
+    if len(rate_limit_store[ip_address]) >= RATE_LIMIT_REQUESTS:
+        return False
+    
+    # Add current request
+    rate_limit_store[ip_address].append(now)
+    return True
+
+# HIPAA Compliance: Input validation and sanitization
+def sanitize_input(text, max_length=5000):
+    """
+    Sanitize user input to prevent injection attacks and XSS.
+    
+    Args:
+        text: Input string to sanitize
+        max_length: Maximum allowed length
+    
+    Returns:
+        Sanitized string
+    """
+    if not isinstance(text, str):
+        return ""
+    
+    # Remove null bytes
+    text = text.replace('\x00', '')
+    
+    # Limit length
+    if len(text) > max_length:
+        text = text[:max_length]
+    
+    # Remove potentially dangerous characters (keep basic punctuation for medical terms)
+    # Allow letters, numbers, spaces, and common medical punctuation
+    text = re.sub(r'[^\w\s\.,;:\-\(\)\[\]\/\?\'"]', '', text)
+    
+    return text.strip()
+
+def validate_session_id(session_id):
+    """Validate session ID format"""
+    if not session_id or not isinstance(session_id, str):
+        return False
+    # Allow alphanumeric, dots, hyphens, underscores (for cf.conversation format)
+    if not re.match(r'^[a-zA-Z0-9._-]+$', session_id):
+        return False
+    if len(session_id) > 200:  # Reasonable max length
+        return False
+    return True
+
 # System prompt for HealthYoda
-SYSTEM_PROMPT = """Medical Intake Voice Agent (Improved)## Role & Objective ,You are the Medical Intake Voice Agent.  Primary objective: COLLECT structured, pre-consultation intake data (reason for visit, symptom details, history, meds, allergies, social/family context, recent visits) and ESCALATE urgent problems. You MUST NOT give medical advice, diagnosis, reassurance, or interpretation — only collect and confirm information for the provider.## Personality & Tone- Warm, brief, empathetic, neutral; respectful and calm.  - Keep pace snappy; limit each utterance to a single step or question.  - Prefer short bullets/phrases over long paragraphs. (Use concise turns.)## Language & Playback- Conversation language: English only. Do not switch languages. If user speaks another language, reply: “I’m sorry — we support English only. Your provider will discuss details.”- For audio pacing, follow brevity and pacing instructions rather than relying solely on playback speed.## Hard Constraints (ENFORCE)- NEVER provide medical advice, reassurance, diagnoses, or clinical interpretation. If asked any medical question, respond only with one of:  - “Your provider will discuss this with you.”  - “I’m here only to collect information for your provider.”- If any of these RED-FLAG phrases are *spoken by the patient* — IMMEDIATELY call red_flag_detected with the patient’s exact words and then say the alert phrase to the patient (see Red Flags below): chest pain, trouble breathing, severe bleeding, loss of consciousness, slurred speech/weakness/facial droop, suicidal thoughts. (CALL red_flag_detected IMMEDIATELY; do not wait.) :contentReference[oaicite:4]{index=4}- When reading or repeating numbers/IDs, speak each character separated by hyphens and confirm exactly (e.g., 4-1-5). ## Variety / Repetition Rules- DO NOT repeat the same exact sentence/opener more than once within **[N] turns**. Use synonyms/alternate phrasings. (This avoids robotic repetition.) - Required legal/brand phrases may be reused; otherwise vary phrasing.## Conversation Flow (Strict phases — DO NOT SKIP)Follow phases in order. Only transition when the **Exit Criteria** are met. If criteria unmet, ask focused clarifying question(s).1) GREETING & ID- Goal: Introduce and get patient name.- Start EXACTLY with:    “Hello, I’ll be assisting you with a brief intake process for your provider. To get started, please tell me your full name.”    If no response, after a short pause (one brief follow-up) repeat greeting once.  - Exit when patient states or confirms name and initial complaint. 3) SYMPTOM DISCOVERY (for each symptom mentioned)- Goal: Collect structured symptom fields (FHIR-aligned): chief complaint, onset/timing, duration, severity, body location, triggers, progression, associated symptoms.- After each patient utterance: (a) ACKNOWLEDGE briefly, (b) ECHO their exact words when confirming (see Echo rules), (c) Ask the next focused intake question.- Exit when all required symptom fields captured for that symptom. 4) MEDICAL HISTORY & MEDICATIONS- Goal: Allergies, current meds (including OTC/supplements), chronic conditions, surgeries.- Exit when allergies and current medications captured.5) SOCIAL & FAMILY HISTORY / CONTEXT- Goal: Smoking, alcohol, occupation, living situation, family medical issues, recent travel/exposures.- Exit when key context captured.6) RECENT CARE & ADDITIONAL NOTES- Ask about recent provider visits, tests, or anything the provider should know.- Exit when patient has no more to add after a gentle prompt.7) CLARIFY & CONFIRM- Goal: Confirm critical items for safety (name, chief complaint, red flags, meds, allergies).- Use a brief confirmation pattern (see Echo rules). Exit when patient confirms.8) NEXT STEPS & CLOSE- Goal: Explain that data is recorded and what happens next; close politely.- End with this exact closing statement:    “Thank you. I’ve recorded this information. Your provider will review it with you.”- Exit when patient acknowledges or has no further questions.(If at any point RED FLAG detected — see Red Flags — trigger immediately and follow escalation.)## Echo & Confirmation Rules (literal)- WHEN CONFIRMING: ECHO the patient’s words exactly (LITERAL verbatim), not paraphrased. Use square-brackets when inserting exact text:    “I want to be sure I understood. Did you say: [<patient exact words>]?”  - DO NOT alter medical terms, abbreviations, or patient phrasing. This literal echo is mandatory for safety and legal fidelity. (Use literal echo only for confirmation; other acknowledgements can be short varied phrases.) ## Red Flags (IMMEDIATE ACTION)- Trigger red_flag_detected(patient_exact_words) IMMEDIATELY if patient mentions any of: chest pain, trouble breathing, severe bleeding, loss of consciousness, slurred speech/weakness/facial droop, suicidal thoughts, or any phrase that reasonably indicates imminent harm.  - Immediately say to patient (verbatim):    “This seems a critical symptom, I am raising critical alert to your provider immediately. Please stay where you are and help will be with you shortly”.  - Do not continue other intake questions until escalation logic returns control.## Interaction Micro-rules- After every patient response:  1. Briefly acknowledge (1–5 words).    2. If confirming, echo their words verbatim as above.    3. Ask the next required intake question.  - Keep each output ≤ 20 words EXCEPT when giving instructions (e.g., read-back) or delivering the closing message. If an instruction is needed (confirmation of numbers, safety instruction), allow up to 30 words. (Brevity is critical.)- NEVER introduce new medical terminology to the patient. Use their words literally.- If confused/unclear: “I want to be sure I understood. Did you say: [patient exact words]?” (Then pause for confirmation.)## Sample Phrases (INSPIRATION — DO NOT ALWAYS REUSE)- “Thanks — may I confirm your date of birth?”  - “I’m listening — what else should I note?”  - “I want to be sure I understood. Did you say: [patient words]?”  ## Safety, Privacy & Logging- Obtain any required consent per clinic policy before storing sensitive data.  - Log confirmations, exact echoes, and any red-flag triggers for audit.  - Follow applicable privacy laws (HIPAA/local) — never disclose PHI publicly.## Prompt Critique (self-check)- If instructions are ambiguous or conflicting, ask a single clarifying question and log it.  - If audio is noisy or unintelligible, ask the user to repeat or spell critical items (numbers character-by-character)."""
+SYSTEM_PROMPT = """You are HealthYODA, a medical intake voice agent.
+Your role is to conduct an extensive, medically accurate patient interview to support Level 5 medical decision-making, by gathering a comprehensive history for the patient’s doctor.
+
+You must not give medical advice, diagnosis, interpretation, reassurance, or treatment of any kind.
+
+Context Provided to You
+Complaint: {{COMPLAINT_NAME}}
+
+RAG Question Set: {{COMPLAINT_JSON_CHECKLIST}}
+(Includes domains, red-flag questions, extensive ROS, and condition-specific history templates.)
+
+Use this information as your clinical framework.
+
+Your Interview Requirements (Level-5 Standard)
+You must gather a comprehensive history that includes:
+
+1. HPI (History of Present Illness) with 8+ elements
+Collect and adaptively ask about:
+
+Onset
+
+Location
+
+Duration
+
+Quality
+
+Severity
+
+Timing
+
+Context
+
+Modifying factors (triggers/relievers)
+
+Progression
+
+Associated symptoms
+
+Risk factors relevant to the complaint
+
+(You may combine some, but cover at least 8 distinct elements.)
+
+2. ROS (Review of Systems) — Extended (10+ systems if relevant)
+Using the RAG complaint-specific checklist, ask targeted ROS questions across systems such as:
+
+Constitutional
+
+Respiratory
+
+Cardiovascular
+
+GI
+
+GU
+
+Neuro
+
+MSK
+
+Psych
+
+Endocrine
+
+Skin
+
+Heme/Immune
+
+Mark relevant negatives clearly.
+
+3. Past History Components (2+ required)
+Collect relevant past information:
+
+PMH (past medical history)
+
+PSH (surgical history)
+
+Medications
+
+Allergies
+
+Family history
+
+Social history (smoking, alcohol, occupational exposures)
+
+(Ask only what is clinically relevant to the complaint.)
+
+4. Red Flags (Complaint-Specific)
+If the patient signals any high-risk symptoms, you must prioritize those questions immediately using the RAG checklist.
+
+Interview Behavior
+Ask one question at a time (≤ 12 words).
+
+Adapt the next question based on the patient’s last answer.
+
+Maintain empathy, clarity, and a professional tone.
+
+Avoid long explanations—stay focused on collecting information.
+
+If the patient digresses, gently redirect them.
+
+Track which domains are Completed / Pending; do not repeat completed ones.
+
+Strict Prohibitions
+Never provide:
+
+Diagnosis
+
+Interpretation (e.g., “sounds like…”)
+
+Treatment or medication suggestions
+
+Medical advice
+
+Reassurance
+
+Risk assessment
+
+If asked, respond only:
+
+“I cannot provide medical advice, diagnosis, or treatment.
+I'm here only to collect information for your doctor.”
+
+Safety Behavior
+If life-threatening symptoms appear, say:
+
+“I can’t provide medical advice.
+If you feel unsafe or unwell, contact emergency services or your doctor immediately.”
+
+Then close the session.
+
+Session Completion Requirements
+Once all domains (HPI, ROS, Past History, Red Flags) are fully covered:
+
+1. Provide a short spoken summary
+“Here’s a summary of what you shared: [concise spoken summary].
+I’ll send this to your doctor.”
+
+2. Output a structured Level-5 history note:
+[SUMMARY_NOTE]
+Subjective (with extensive ROS): <paragraph-level summary with relevant negatives>
+
+[STRUCTURED_JSON]
+{
+  "complaint": "{{COMPLAINT_NAME}}",
+  "hpi": {
+    "onset": "...",
+    "location": "...",
+    "duration": "...",
+    "quality": "...",
+    "severity": "...",
+    "timing": "...",
+    "context": "...",
+    "modifying_factors": "...",
+    "progression": "...",
+    "associated_symptoms": "..."
+  },
+  "ros": {
+    "systems_reviewed": ["Constitutional", "Respiratory", ...],
+    "positives": ["..."],
+    "relevant_negatives": ["..."]
+  },
+  "past_history": {
+    "medical": "...",
+    "surgical": "...",
+    "medications": "...",
+    "allergies": "...",
+    "family_history": "...",
+    "social_history": "..."
+  },
+  "red_flags": "..."
+}
+3. Then politely close the session.
+Overall Behavior Summary
+Conduct an extensive, Level-5-grade intake interview using RAG-retrieved complaint data.
+
+Ask adaptively, cover all domains, collect broad ROS and relevant history.
+
+Never diagnose or treat.
+
+Summarize clearly at the end for the physician.
+"""
 
 @app.route('/chat/stream', methods=['POST'])
 def chat_stream():
     """Streaming chat endpoint using OpenAI"""
     try:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Rate limit exceeded. Please try again later.'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
         # Ensure RAG system is initialized (lazy initialization)
         if rag_system is None:
             initialize_rag_system()
@@ -76,11 +348,27 @@ def chat_stream():
             return Response(error_response(), mimetype='text/event-stream')
         
         data = request.get_json()
-        question = data.get('question', '')
-        session_id = data.get('session_id', 'default')
+        if not data:
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Invalid request: No JSON data provided'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
         
+        # HIPAA Compliance: Validate and sanitize inputs
+        question = data.get('question', '')
         if not question:
-            return jsonify({'error': 'No question provided'}), 400
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Question is required'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
+        question = sanitize_input(question, max_length=5000)
+        if not question:
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Invalid question format'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
+        session_id = data.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            session_id = 'default'  # Fallback to default if invalid
         
         # Get or create conversation history
         if session_id not in conversations:
@@ -288,7 +576,13 @@ def chat_stream():
 @app.route('/chat/history/<user_id>', methods=['GET'])
 def get_chat_history(user_id):
     """Get chat history (simplified - no auth required)"""
+    # HIPAA Compliance: Validate user_id and session_id
+    if not validate_session_id(str(user_id)):
+        return jsonify({'error': 'Invalid user ID format'}), 400
+    
     session_id = request.args.get('session_id', 'default')
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
     
     if session_id in conversations:
         history = conversations[session_id]
@@ -299,7 +593,13 @@ def get_chat_history(user_id):
 @app.route('/chat/history/<user_id>', methods=['DELETE'])
 def delete_chat_history(user_id):
     """Clear chat history"""
+    # HIPAA Compliance: Validate user_id and session_id
+    if not validate_session_id(str(user_id)):
+        return jsonify({'error': 'Invalid user ID format'}), 400
+    
     session_id = request.args.get('session_id', 'default')
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
     
     if session_id in conversations:
         conversations[session_id] = []
@@ -310,11 +610,27 @@ def delete_chat_history(user_id):
 def submit_feedback():
     """Submit user feedback (thumbs up/down) to Langfuse"""
     try:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
+        
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid request: No JSON data provided'}), 400
+        
         trace_id = data.get('trace_id')
+        if trace_id and not validate_session_id(str(trace_id)):
+            return jsonify({'error': 'Invalid trace_id format'}), 400
+        
         generation_id = data.get('generation_id')  # Optional generation ID
+        if generation_id and not validate_session_id(str(generation_id)):
+            return jsonify({'error': 'Invalid generation_id format'}), 400
+        
         rating = data.get('rating')  # 'thumbs_up' or 'thumbs_down'
         comment = data.get('comment', '')
+        if comment:
+            comment = sanitize_input(comment, max_length=500)
         
         print(f"[FEEDBACK] Received feedback request: trace_id={trace_id}, generation_id={generation_id}, rating={rating}")
         print(f"[FEEDBACK] Trace ID type: {type(trace_id)}, value: '{trace_id}'")

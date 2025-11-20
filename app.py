@@ -5,10 +5,20 @@ import json
 import time
 import os
 import re
+from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 from langfuse_tracker import langfuse_tracker
 from rag_system import QuestionBookRAG
+
+# MongoDB imports
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    MONGODB_AVAILABLE = True
+except ImportError:
+    MONGODB_AVAILABLE = False
+    print("⚠️  pymongo not installed - MongoDB features disabled")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -58,10 +68,15 @@ def initialize_rag_system():
         try:
             rag_system = QuestionBookRAG('docx/Question BOOK.docx', openai_client=client)
             print(f"✅ RAG System loaded: {len(rag_system.questions)} questions available")
-            if rag_system.collection and rag_system.collection.count() > 0:
-                print(f"✅ Vector database ready: {rag_system.collection.count()} embeddings available")
-            elif rag_system.collection:
-                print(f"ℹ️  Vector database initialized (no embeddings yet)")
+            if rag_system.collection is not None:
+                try:
+                    count = rag_system.collection.count()
+                    if count > 0:
+                        print(f"✅ Vector database ready: {count} embeddings available")
+                    else:
+                        print(f"ℹ️  Vector database initialized (no embeddings yet)")
+                except Exception as e:
+                    print(f"ℹ️  Vector database initialized (error checking count: {e})")
         except Exception as e:
             print(f"⚠️  Warning: Could not load RAG system: {e}")
             import traceback
@@ -72,13 +87,61 @@ def initialize_rag_system():
 # With debug=False, Flask runs in a single process, so initialization happens once
 initialize_rag_system()
 
-# Simple in-memory conversation history
+# Simple in-memory conversation history (for LLM context only)
 conversations = {}
+
+# MongoDB connection for storing structured medical data
+mongodb_client = None
+mongodb_db = None
+patient_sessions_collection = None
+
+def initialize_mongodb():
+    """Initialize MongoDB connection"""
+    global mongodb_client, mongodb_db, patient_sessions_collection
+    
+    if not MONGODB_AVAILABLE:
+        print("⚠️  MongoDB not available - session data will not be persisted")
+        return False
+    
+    try:
+        mongodb_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+        mongodb_db_name = os.getenv('MONGODB_DB', 'healthyoda')
+        
+        mongodb_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongodb_client.admin.command('ping')
+        mongodb_db = mongodb_client[mongodb_db_name]
+        patient_sessions_collection = mongodb_db['patient_sessions']
+        
+        # Create indexes for faster queries
+        # session_id is UNIQUE - each session gets its own document
+        # FUTURE: After auth, add user_id index and migrate from session_id to user_id
+        patient_sessions_collection.create_index('session_id', unique=True)
+        patient_sessions_collection.create_index('created_at')
+        
+        print(f"✅ MongoDB connected: {mongodb_db_name}")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        print(f"⚠️  MongoDB connection failed: {e}")
+        print("   Session data will not be persisted. Set MONGODB_URI in .env to enable.")
+        mongodb_client = None
+        mongodb_db = None
+        patient_sessions_collection = None
+        return False
+    except Exception as e:
+        print(f"⚠️  MongoDB initialization error: {e}")
+        mongodb_client = None
+        mongodb_db = None
+        patient_sessions_collection = None
+        return False
+
+# Initialize MongoDB
+mongodb_connected = initialize_mongodb()
 
 # HIPAA Compliance: Rate limiting (simple in-memory implementation)
 # In production, use Redis or similar for distributed rate limiting
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 rate_limit_store = defaultdict(list)  # IP -> list of request timestamps
 RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', '100'))  # requests per window
@@ -141,6 +204,500 @@ def validate_session_id(session_id):
     if len(session_id) > 200:  # Reasonable max length
         return False
     return True
+
+# MongoDB Session Data Management
+# NOTE: Currently uses session_id as unique identifier.
+# FUTURE: After adding authentication, replace session_id with user_id for user-based storage.
+# Each session_id = one unique patient session = one MongoDB document
+def get_or_create_session_data(session_id):
+    """
+    Get or create session data structure in MongoDB.
+    Stores only structured medical data, NOT full chat history.
+    
+    Each session_id is unique and maps to one MongoDB document.
+    In the future, this will be replaced with user_id after authentication is added.
+    
+    Args:
+        session_id: Unique session identifier (currently from frontend, future: user_id)
+    
+    Returns:
+        Dictionary with session data structure
+    """
+    if patient_sessions_collection is None:
+        # Fallback to in-memory if MongoDB not available
+        return {
+            'session_id': session_id,
+            'complaint_name': None,
+            'hpi': {},
+            'ros': {},
+            'past_history': {},
+            'red_flags': [],
+            'qa_pairs': [],  # Store ALL question-answer pairs
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+    
+    try:
+        session_data = patient_sessions_collection.find_one({'session_id': session_id})
+        if not session_data:
+            # Create new session
+            # Each session_id is UNIQUE - one document per session
+            # FUTURE: After auth, add user_id field and use it as primary identifier
+            session_data = {
+                'session_id': session_id,  # UNIQUE identifier - one document per session
+                # 'user_id': None,  # FUTURE: Add after authentication is implemented
+                'complaint_name': None,
+                'hpi': {},  # Store actual HPI data: {'onset': '...', 'location': '...', etc.}
+                'ros': {},  # Store ROS data by system: {'respiratory': {...}, 'cardiovascular': {...}}
+                'past_history': {
+                    'pmh': None,
+                    'psh': None,
+                    'medications': [],
+                    'allergies': [],
+                    'family_history': None,
+                    'social_history': {}
+                },
+                'red_flags': [],
+                'qa_pairs': [],  # NEW: Store ALL question-answer pairs including "no" responses
+                'created_at': datetime.now(),
+                'updated_at': datetime.now()
+            }
+            patient_sessions_collection.insert_one(session_data)
+            print(f"[MongoDB] Created new session: {session_id}")
+        else:
+            # Convert ObjectId to string for JSON serialization
+            if '_id' in session_data:
+                session_data['_id'] = str(session_data['_id'])
+        return session_data
+    except Exception as e:
+        print(f"[MongoDB] Error getting session data: {e}")
+        return None
+
+def update_session_data(session_id, updates):
+    """
+    Update session data in MongoDB.
+    
+    Each session_id has its own unique document. Updates are scoped to that session.
+    FUTURE: After auth, this will update by user_id instead of session_id.
+    
+    Args:
+        session_id: Unique session identifier
+        updates: Dictionary of fields to update (e.g., {'hpi.onset': '2 hours ago'})
+    
+    Returns:
+        True if update successful, False otherwise
+    """
+    if patient_sessions_collection is None:
+        return False
+    
+    try:
+        updates['updated_at'] = datetime.now()
+        result = patient_sessions_collection.update_one(
+            {'session_id': session_id},
+            {'$set': updates}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        print(f"[MongoDB] Error updating session data: {e}")
+        return False
+
+def map_category_to_data_field(category, system=None):
+    """
+    Map RAG question category to data field in session structure.
+    Returns the field path and whether data is already collected.
+    """
+    category_lower = category.lower() if category else ''
+    
+    # Map HPI categories
+    hpi_mapping = {
+        'onset/duration': 'hpi.onset',
+        'onset': 'hpi.onset',
+        'duration': 'hpi.duration',
+        'location': 'hpi.location',
+        'quality/severity': 'hpi.quality',
+        'quality': 'hpi.quality',
+        'severity': 'hpi.severity',
+        'timing': 'hpi.timing',
+        'context': 'hpi.context',
+        'aggravating/relieving': 'hpi.modifying_factors',
+        'modifying factors': 'hpi.modifying_factors',
+        'progression': 'hpi.progression',
+        'associated symptoms': 'hpi.associated_symptoms',
+        'chief complaint': 'hpi.chief_complaint'
+    }
+    
+    # Map ROS categories
+    ros_mapping = {
+        'ros': 'ros',
+        'review of systems': 'ros'
+    }
+    
+    # Map Past History categories
+    past_history_mapping = {
+        'pmh': 'past_history.pmh',
+        'past medical history': 'past_history.pmh',
+        'psh': 'past_history.psh',
+        'surgical history': 'past_history.psh',
+        'medications': 'past_history.medications',
+        'allergies': 'past_history.allergies',
+        'family history': 'past_history.family_history',
+        'social history': 'past_history.social_history'
+    }
+    
+    # Check mappings
+    if category_lower in hpi_mapping:
+        return hpi_mapping[category_lower], 'hpi'
+    elif category_lower in ros_mapping:
+        # ROS needs system name
+        if system:
+            system_lower = system.lower()
+            # Map system names to ROS fields
+            ros_systems = {
+                'constitutional': 'constitutional',
+                'respiratory': 'respiratory',
+                'cardiovascular': 'cardiovascular',
+                'cardiac': 'cardiovascular',
+                'gi': 'gi',
+                'gastrointestinal': 'gi',
+                'gu': 'gu',
+                'genitourinary': 'gu',
+                'neurologic': 'neuro',
+                'neurological': 'neuro',
+                'neuro': 'neuro',
+                'msk': 'msk',
+                'musculoskeletal': 'msk',
+                'psych': 'psych',
+                'psychiatric': 'psych',
+                'endocrine': 'endocrine',
+                'skin': 'skin',
+                'dermatologic': 'skin',
+                'heme': 'heme_immune',
+                'immune': 'heme_immune'
+            }
+            if system_lower in ros_systems:
+                return f"ros.{ros_systems[system_lower]}", 'ros'
+        return 'ros', 'ros'
+    elif category_lower in past_history_mapping:
+        return past_history_mapping[category_lower], 'past_history'
+    elif 'red flag' in category_lower:
+        return 'red_flags', 'red_flags'
+    
+    return None, None
+
+def is_data_already_collected(session_id, category, system=None, question_text=None):
+    """
+    Check if data for a given category/system is already collected in MongoDB.
+    Returns True if data exists, False if needs to be collected.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return False
+    
+    field_path, data_type = map_category_to_data_field(category, system)
+    if not field_path:
+        # Unknown category, allow question
+        return False
+    
+    # Check if data exists
+    if data_type == 'hpi':
+        field_name = field_path.split('.')[-1]
+        return session_data.get('hpi', {}).get(field_name) is not None and session_data['hpi'][field_name] != ''
+    elif data_type == 'ros':
+        if '.' in field_path:
+            system_name = field_path.split('.')[-1]
+            ros_data = session_data.get('ros', {})
+            return system_name in ros_data and ros_data[system_name] is not None
+        return False
+    elif data_type == 'past_history':
+        field_name = field_path.split('.')[-1]
+        past_data = session_data.get('past_history', {})
+        value = past_data.get(field_name)
+        if field_name in ['medications', 'allergies']:
+            return isinstance(value, list) and len(value) > 0
+        return value is not None and value != ''
+    elif data_type == 'red_flags':
+        red_flags = session_data.get('red_flags', [])
+        if question_text:
+            # Check if this specific red flag question was already asked
+            return question_text in [rf.get('question', '') for rf in red_flags]
+        return len(red_flags) > 0
+    
+    return False
+
+def store_qa_pair(session_id, question, answer):
+    """
+    Store question-answer pair dynamically.
+    Stores EVERYTHING including "no" responses.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    # Get existing Q&A pairs
+    qa_pairs = session_data.get('qa_pairs', [])
+    
+    # Add new Q&A pair
+    qa_pairs.append({
+        'question': question,
+        'answer': answer,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Update in MongoDB
+    update_session_data(session_id, {'qa_pairs': qa_pairs})
+    print(f"[MongoDB] Stored Q&A: Q='{question[:50]}...' A='{answer[:50]}...'")
+
+def was_question_asked(session_id, new_question):
+    """
+    Check if a similar question was already asked.
+    Uses semantic similarity to avoid exact match requirements.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return False
+    
+    qa_pairs = session_data.get('qa_pairs', [])
+    if not qa_pairs:
+        return False
+    
+    # Simple keyword matching for now (can enhance with embeddings later)
+    new_question_lower = new_question.lower()
+    new_keywords = set(new_question_lower.split())
+    
+    for qa in qa_pairs:
+        asked_question = qa.get('question', '').lower()
+        asked_keywords = set(asked_question.split())
+        
+        # Calculate overlap
+        common_keywords = new_keywords & asked_keywords
+        if len(common_keywords) >= 3:  # At least 3 words in common
+            print(f"[MongoDB] Similar question already asked: '{asked_question[:50]}...'")
+            return True
+    
+    return False
+
+def extract_and_store_data_with_llm(session_id, user_response, bot_question, conversation_context):
+    """
+    Store question-answer pair AND extract structured data.
+    Stores ALL responses including "no".
+    """
+    if not client:  # No OpenAI client
+        return
+    
+    # ALWAYS store the Q&A pair first (even "no" responses)
+    store_qa_pair(session_id, bot_question, user_response)
+    
+    # Skip structured extraction for very short responses
+    if len(user_response.strip()) <= 3 or user_response.lower() in ['no', 'yes', 'nope', 'yeah', 'yep', 'nah']:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    # Use LLM to extract structured data for longer responses
+    extraction_prompt = f"""Extract medical data from patient's response.
+
+Question: "{bot_question}"
+Response: "{user_response}"
+
+Extract relevant information WITHOUT predefined keys. Create appropriate field names based on what was asked.
+
+Examples:
+- Q: "When did it start?" A: "yesterday" → {{"symptom_onset": "yesterday"}}
+- Q: "Where is the pain?" A: "right shoulder" → {{"pain_location": "right shoulder"}}
+- Q: "Any medications?" A: "paracetamol" → {{"current_medications": ["paracetamol"]}}
+- Q: "Do you smoke?" A: "no" → {{"smoking_status": "no"}}
+
+Return JSON with dynamic field names. If no meaningful data, return: {{}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{'role': 'user', 'content': extraction_prompt}],
+            temperature=0.1,
+            max_tokens=500
+        )
+        
+        extracted_text = response.choices[0].message.content.strip()
+        # Parse JSON
+        import json
+        # Remove markdown code blocks if present
+        if '```json' in extracted_text:
+            extracted_text = extracted_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in extracted_text:
+            extracted_text = extracted_text.split('```')[1].split('```')[0].strip()
+        
+        extracted_data = json.loads(extracted_text)
+        
+        if not extracted_data:
+            return
+        
+        # Store with dynamic field names (no predefined structure)
+        updates = {}
+        for key, value in extracted_data.items():
+            if value:  # Only store non-empty values
+                # Store in HPI if it's a symptom-related field
+                if any(term in key.lower() for term in ['onset', 'location', 'duration', 'quality', 'severity', 'timing', 'context', 'modifying', 'progression', 'symptom', 'complaint', 'pain']):
+                    updates[f'hpi.{key}'] = value
+                    print(f"[LLM Extract] hpi.{key}: {str(value)[:50]}...")
+                # Store in past_history if it's history-related
+                elif any(term in key.lower() for term in ['history', 'medication', 'allergy', 'surgery', 'smoking', 'alcohol', 'family']):
+                    if isinstance(value, list):
+                        updates[f'past_history.{key}'] = value
+                    else:
+                        updates[f'past_history.{key}'] = value
+                    print(f"[LLM Extract] past_history.{key}: {str(value)[:50]}...")
+                # Store in ROS if it's a system review
+                elif any(term in key.lower() for term in ['respiratory', 'cardiac', 'neuro', 'gi', 'gu', 'msk', 'skin', 'psych']):
+                    updates[f'ros.{key}'] = value
+                    print(f"[LLM Extract] ros.{key}: {str(value)[:50]}...")
+                else:
+                    # Store in HPI by default for general medical info
+                    updates[f'hpi.{key}'] = value
+                    print(f"[LLM Extract] hpi.{key}: {str(value)[:50]}...")
+        
+        if updates:
+            update_session_data(session_id, updates)
+            print(f"[MongoDB] Stored {len(updates)} dynamic fields")
+            
+    except Exception as e:
+        print(f"[LLM Extract] Error: {e}")
+
+
+def extract_and_store_data(session_id, user_response, rag_question_info):
+    """
+    Legacy function for RAG-based extraction.
+    Kept for compatibility but now also calls LLM extraction.
+    """
+    if not rag_question_info:
+        return
+    
+    category = rag_question_info.get('category', '')
+    system = rag_question_info.get('system', '')
+    question_text = rag_question_info.get('question', '')
+    
+    field_path, data_type = map_category_to_data_field(category, system)
+    if not field_path:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    updates = {}
+    
+    if data_type == 'hpi':
+        field_name = field_path.split('.')[-1]
+        if not session_data.get('hpi', {}).get(field_name):
+            updates[f'hpi.{field_name}'] = user_response
+    elif data_type == 'ros':
+        if '.' in field_path:
+            system_name = field_path.split('.')[-1]
+            if system_name not in session_data.get('ros', {}):
+                updates[f'ros.{system_name}'] = user_response
+    elif data_type == 'past_history':
+        field_name = field_path.split('.')[-1]
+        if field_name in ['medications', 'allergies']:
+            # These are lists
+            current_list = session_data.get('past_history', {}).get(field_name, [])
+            if user_response not in current_list:
+                current_list.append(user_response)
+                updates[f'past_history.{field_name}'] = current_list
+        else:
+            if not session_data.get('past_history', {}).get(field_name):
+                updates[f'past_history.{field_name}'] = user_response
+    elif data_type == 'red_flags':
+        red_flags = session_data.get('red_flags', [])
+        # Check if this red flag already recorded
+        if not any(rf.get('question') == question_text for rf in red_flags):
+            red_flags.append({
+                'question': question_text,
+                'response': user_response,
+                'timestamp': datetime.now().isoformat()
+            })
+            updates['red_flags'] = red_flags
+    
+    # Also update complaint name if this is chief complaint
+    if category and 'chief complaint' in category.lower():
+        if not session_data.get('complaint_name'):
+            # Extract complaint from user response
+            updates['complaint_name'] = user_response[:100]  # Limit length
+    
+    if updates:
+        update_session_data(session_id, updates)
+        print(f"[MongoDB] Stored data for {field_path}: {user_response[:50]}...")
+
+def format_collected_data_for_llm(session_id):
+    """
+    Format already collected data as context for LLM.
+    Shows Q&A pairs AND structured data so LLM knows what NOT to ask again.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return ""
+    
+    context_parts = []
+    
+    # Show recent Q&A pairs (last 15 to avoid token limit)
+    qa_pairs = session_data.get('qa_pairs', [])
+    if qa_pairs:
+        context_parts.append("QUESTIONS ALREADY ASKED:")
+        recent_qa = qa_pairs[-15:]  # Last 15 Q&A pairs
+        for qa in recent_qa:
+            q = qa.get('question', '').strip()
+            a = qa.get('answer', '').strip()
+            context_parts.append(f"  Q: {q[:70]}...")
+            context_parts.append(f"  A: {a[:70]}...")
+    
+    # HPI data collected with values
+    hpi_data = session_data.get('hpi', {})
+    if hpi_data:
+        hpi_items = []
+        for key, value in hpi_data.items():
+            if value:
+                hpi_items.append(f"{key}: {value}")
+        if hpi_items:
+            context_parts.append("\nSTRUCTURED HPI DATA:")
+            context_parts.extend([f"  - {item}" for item in hpi_items])
+    
+    # ROS systems reviewed with values
+    ros_data = session_data.get('ros', {})
+    if ros_data:
+        ros_items = []
+        for system, value in ros_data.items():
+            if value:
+                ros_items.append(f"{system}: {value}")
+        if ros_items:
+            context_parts.append("\nROS DATA:")
+            context_parts.extend([f"  - {item}" for item in ros_items])
+    
+    # Past history collected with values
+    past_data = session_data.get('past_history', {})
+    past_items = []
+    for key, value in past_data.items():
+        if value:
+            if isinstance(value, list) and len(value) > 0:
+                past_items.append(f"{key}: {', '.join(value)}")
+            elif isinstance(value, dict) and value:
+                past_items.append(f"{key}: {str(value)}")
+            elif not isinstance(value, (list, dict)) and value:
+                past_items.append(f"{key}: {value}")
+    if past_items:
+        context_parts.append("\nPAST HISTORY:")
+        context_parts.extend([f"  - {item}" for item in past_items])
+    
+    if context_parts:
+        header = "\n\n[INFORMATION ALREADY COLLECTED - DO NOT RE-ASK]\n"
+        header += "="*70 + "\n"
+        body = "\n".join(context_parts)
+        footer = "\n" + "="*70
+        footer += "\n⚠️  CRITICAL: DO NOT ask questions that were already asked above!"
+        footer += "\nFocus ONLY on collecting NEW information.\n"
+        return header + body + footer
+    
+    return ""
 
 # System prompt for HealthYoda
 SYSTEM_PROMPT = """You are HealthYODA, a medical intake voice agent.
@@ -277,45 +834,56 @@ Then close the session.
 Session Completion Requirements
 Once all domains (HPI, ROS, Past History, Red Flags) are fully covered:
 
-1. Provide a short spoken summary
-“Here’s a summary of what you shared: [concise spoken summary].
-I’ll send this to your doctor.”
+1. Say: "Thank you for your time. I'll send this to your doctor."
 
-2. Output a structured Level-5 history note:
-[SUMMARY_NOTE]
-Subjective (with extensive ROS): <paragraph-level summary with relevant negatives>
+2. Output a SINGLE markdown-formatted summary:
 
-[STRUCTURED_JSON]
-{
-  "complaint": "{{COMPLAINT_NAME}}",
-  "hpi": {
-    "onset": "...",
-    "location": "...",
-    "duration": "...",
-    "quality": "...",
-    "severity": "...",
-    "timing": "...",
-    "context": "...",
-    "modifying_factors": "...",
-    "progression": "...",
-    "associated_symptoms": "..."
-  },
-  "ros": {
-    "systems_reviewed": ["Constitutional", "Respiratory", ...],
-    "positives": ["..."],
-    "relevant_negatives": ["..."]
-  },
-  "past_history": {
-    "medical": "...",
-    "surgical": "...",
-    "medications": "...",
-    "allergies": "...",
-    "family_history": "...",
-    "social_history": "..."
-  },
-  "red_flags": "..."
-}
-3. Then politely close the session.
+---
+
+## Patient Summary
+
+### Chief Complaint
+[Main complaint]
+
+### History of Present Illness (HPI)
+- **Onset:** [when started]
+- **Location:** [where]
+- **Duration:** [how long]
+- **Quality:** [description]
+- **Severity:** [1-10 or description]
+- **Timing:** [constant/intermittent]
+- **Context:** [what was happening]
+- **Modifying Factors:** [what makes better/worse]
+- **Progression:** [getting better/worse/same]
+- **Associated Symptoms:** [other symptoms]
+
+### Review of Systems (ROS)
+**Systems Reviewed:** [list systems]
+
+**Positive Findings:**
+- [symptom 1]
+- [symptom 2]
+
+**Relevant Negatives:**
+- [no symptom 1]
+- [no symptom 2]
+
+### Past Medical History
+- **PMH:** [conditions]
+- **PSH:** [surgeries]
+- **Medications:** [current meds]
+- **Allergies:** [allergies or none]
+- **Family History:** [relevant family history]
+- **Social History:** [smoking, alcohol, occupation]
+
+### Red Flags
+[Any concerning symptoms or "None identified"]
+
+---
+
+3. Then say: "I wish you well."
+
+DO NOT output multiple formats. Output ONLY the markdown summary above.
 Overall Behavior Summary
 Conduct an extensive, Level-5-grade intake interview using RAG-retrieved complaint data.
 
@@ -379,6 +947,37 @@ def chat_stream():
         # Add user message to history
         conversation_history.append({'role': 'user', 'content': question})
         
+        # Store the previous RAG question info in conversation metadata for data extraction
+        # We'll store it when bot asks a question, then use it when user responds
+        prev_rag_info = None
+        if len(conversation_history) > 2:  # Need at least user-bot-user pattern
+            # Try to get the RAG question that was asked in the previous bot message
+            # Look for the last assistant message before this user message
+            for i in range(len(conversation_history) - 2, -1, -1):
+                if conversation_history[i].get('role') == 'assistant':
+                    # Check if we stored RAG info in metadata (we'll add this later)
+                    prev_rag_info = conversation_history[i].get('rag_question_info')
+                    break
+        
+        # Extract and store data from user response to previous question
+        # Use LLM extraction for ALL responses (not just RAG-tagged)
+        prev_bot_question = ""
+        if len(conversation_history) > 1:
+            # Get the last bot question
+            for i in range(len(conversation_history) - 2, -1, -1):
+                if conversation_history[i].get('role') == 'assistant':
+                    prev_bot_question = conversation_history[i].get('content', '')
+                    break
+        
+        if prev_bot_question and len(question) > 2:  # Skip very short responses like "no"
+            # Use LLM to extract data from ANY response
+            recent_context = " ".join([msg.get('content', '') for msg in conversation_history[-6:]])
+            extract_and_store_data_with_llm(session_id, question, prev_bot_question, recent_context)
+        
+        # Also use legacy RAG-based extraction if available
+        if prev_rag_info:
+            extract_and_store_data(session_id, question, prev_rag_info)
+        
         # Retrieve relevant question from RAG system if available
         rag_context = ""
         rag_question_info = None
@@ -394,23 +993,39 @@ def chat_stream():
                 system=None  # Can be detected from context
             )
             
+            # Check MongoDB: Skip this question if data is already collected
             if rag_question_info:
-                rag_context = f"\n\n[RELEVANT QUESTION FROM QUESTION BOOK]\n"
-                rag_context += f"Question: {rag_question_info['question']}\n"
-                if rag_question_info.get('possible_answers'):
-                    rag_context += f"Possible answers: {', '.join(rag_question_info['possible_answers'][:5])}\n"
+                category = rag_question_info.get('category', '')
+                system = rag_question_info.get('system', '')
+                question_text = rag_question_info.get('question', '')
                 
-                # Log the question tree branch being used
-                tree_path = rag_question_info.get('tree_path', 'Unknown')
-                tags = rag_question_info.get('tags', [])
-                print(f"\n{'='*80}")
-                print(f"[RAG] Question Tree Branch: {tree_path}")
-                print(f"[RAG] Tags: {', '.join(tags)}")
-                print(f"[RAG] Question: {rag_question_info['question']}")
-                print(f"{'='*80}\n")
+                if is_data_already_collected(session_id, category, system, question_text):
+                    print(f"[MongoDB] Data already collected for category '{category}' (system: {system}), skipping question: {question_text[:50]}...")
+                    rag_question_info = None  # Skip this question
+                    # Try to get a different question (you could enhance RAG to exclude collected categories)
+                else:
+                    rag_context = f"\n\n[RELEVANT QUESTION FROM QUESTION BOOK]\n"
+                    rag_context += f"Question: {rag_question_info['question']}\n"
+                    if rag_question_info.get('possible_answers'):
+                        rag_context += f"Possible answers: {', '.join(rag_question_info['possible_answers'][:5])}\n"
+                    
+                    # Log the question tree branch being used
+                    tree_path = rag_question_info.get('tree_path', 'Unknown')
+                    tags = rag_question_info.get('tags', [])
+                    print(f"\n{'='*80}")
+                    print(f"[RAG] Question Tree Branch: {tree_path}")
+                    print(f"[RAG] Tags: {', '.join(tags)}")
+                    print(f"[RAG] Question: {rag_question_info['question']}")
+                    print(f"{'='*80}\n")
         
-        # Prepare messages for OpenAI (include system prompt + RAG context)
+        # Prepare messages for OpenAI (include system prompt + RAG context + collected data)
         enhanced_system_prompt = SYSTEM_PROMPT
+        
+        # Add context about already collected data (so LLM doesn't ask again)
+        collected_data_context = format_collected_data_for_llm(session_id)
+        if collected_data_context:
+            enhanced_system_prompt += collected_data_context
+        
         if rag_context:
             enhanced_system_prompt += rag_context
         
@@ -480,8 +1095,11 @@ def chat_stream():
                         full_response += token
                         yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
                 
-                # Add assistant response to history
-                conversation_history.append({'role': 'assistant', 'content': full_response})
+                # Add assistant response to history with RAG question info for next data extraction
+                assistant_msg = {'role': 'assistant', 'content': full_response}
+                if rag_question_info:
+                    assistant_msg['rag_question_info'] = rag_question_info  # Store for next user response
+                conversation_history.append(assistant_msg)
                 
                 # Log tree branch for EVERY chatbot response
                 print(f"\n{'='*80}")
@@ -569,8 +1187,10 @@ def chat_stream():
         return Response(generate(), mimetype='text/event-stream')
     
     except Exception as e:
+        # Capture error message before defining nested function (Python 3.13+ scope issue)
+        error_msg = str(e)
         def error_response():
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
         return Response(error_response(), mimetype='text/event-stream')
 
 @app.route('/chat/history/<user_id>', methods=['GET'])
@@ -664,6 +1284,43 @@ def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy'})
 
+@app.route('/session/<session_id>/data', methods=['GET'])
+def get_session_data(session_id):
+    """
+    Get structured medical data for a session (for doctor/provider access).
+    Returns only structured data, NOT full chat history.
+    
+    Each session_id has its own unique data document in MongoDB.
+    FUTURE: After auth, this endpoint will use user_id instead of session_id.
+    
+    Args:
+        session_id: Unique session identifier
+    
+    Returns:
+        JSON with structured medical data (HPI, ROS, Past History, Red Flags)
+    """
+    # HIPAA Compliance: Validate session_id
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    # Remove MongoDB internal fields and convert datetime to ISO format
+    response_data = {
+        'session_id': session_data.get('session_id'),
+        'complaint_name': session_data.get('complaint_name'),
+        'hpi': session_data.get('hpi', {}),
+        'ros': session_data.get('ros', {}),
+        'past_history': session_data.get('past_history', {}),
+        'red_flags': session_data.get('red_flags', []),
+        'created_at': session_data.get('created_at').isoformat() if isinstance(session_data.get('created_at'), datetime) else session_data.get('created_at'),
+        'updated_at': session_data.get('updated_at').isoformat() if isinstance(session_data.get('updated_at'), datetime) else session_data.get('updated_at')
+    }
+    
+    return jsonify(response_data)
+
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)
     # RAG system is initialized above based on process detection
@@ -687,6 +1344,15 @@ if __name__ == '__main__':
         else:
             print("✅ Langfuse configured! Traces will be logged.")
             print(f"   Using Langfuse tracker module for observability")
+        
+        if not mongodb_connected:
+            print("⚠️  MongoDB not connected. Session data will not be persisted.")
+            print("   Set MONGODB_URI in .env to enable MongoDB (e.g., mongodb://localhost:27017/)")
+            print("   Bot will still work but won't prevent duplicate questions.")
+        else:
+            print("✅ MongoDB connected! Session data will be persisted.")
+            print(f"   Database: {os.getenv('MONGODB_DB', 'healthyoda')}")
+            print(f"   Collection: patient_sessions")
         
         print("-" * 50)
         app._startup_printed = True

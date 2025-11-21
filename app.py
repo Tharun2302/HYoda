@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
 from functools import wraps
 import json
@@ -19,6 +19,14 @@ try:
 except ImportError:
     MONGODB_AVAILABLE = False
     print("⚠️  pymongo not installed - MongoDB features disabled")
+
+# Voice processing imports
+try:
+    import voice_processor
+    VOICE_AVAILABLE = True
+except ImportError:
+    VOICE_AVAILABLE = False
+    print("⚠️  voice_processor not available - voice features disabled")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1321,6 +1329,167 @@ def get_session_data(session_id):
     
     return jsonify(response_data)
 
+@app.route('/voice/transcribe', methods=['POST', 'OPTIONS'])
+def transcribe_voice():
+    """
+    Transcribe audio to text using Whisper.
+    HIPAA Compliant: Audio processed locally, deleted immediately after.
+    """
+    # Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
+        
+        # Check if voice is available
+        if not VOICE_AVAILABLE:
+            return jsonify({'error': 'Voice processing not available'}), 503
+        
+        stt_available, _ = voice_processor.is_voice_available()
+        if not stt_available:
+            return jsonify({'error': 'Speech-to-text not available'}), 503
+        
+        # Check if audio file is present
+        if 'audio' not in request.files:
+            return jsonify({'error': 'No audio file provided'}), 400
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            return jsonify({'error': 'Empty audio file'}), 400
+        
+        # Validate session_id
+        session_id = request.form.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            return jsonify({'error': 'Invalid session ID format'}), 400
+        
+        # Save uploaded audio to temp file
+        import tempfile
+        temp_fd, temp_audio_path = tempfile.mkstemp(suffix='.webm')
+        os.close(temp_fd)
+        
+        try:
+            # Save uploaded file
+            audio_file.save(temp_audio_path)
+            
+            # Check file size (max 10MB for safety)
+            file_size = os.path.getsize(temp_audio_path)
+            max_size = int(os.getenv('MAX_AUDIO_SIZE', '10485760'))  # 10MB default
+            if file_size > max_size:
+                return jsonify({'error': 'Audio file too large'}), 413
+            
+            # Transcribe audio
+            transcription = voice_processor.transcribe_audio(temp_audio_path)
+            
+            if transcription is None:
+                return jsonify({'error': 'Transcription failed'}), 500
+            
+            # Log voice usage (HIPAA: metadata only, no PHI)
+            print(f"[Voice] Transcription for session {session_id}: {len(transcription)} chars")
+            
+            return jsonify({
+                'text': transcription,
+                'session_id': session_id,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+        finally:
+            # HIPAA Compliance: Delete temp file immediately
+            voice_processor.cleanup_temp_file(temp_audio_path)
+    
+    except Exception as e:
+        print(f"[Voice] Transcription error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/voice/synthesize', methods=['POST', 'OPTIONS'])
+def synthesize_voice():
+    """
+    Convert text to speech using pyttsx3.
+    HIPAA Compliant: Audio generated locally, no storage.
+    """
+    # Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        print(f"[Voice] TTS endpoint called")
+        
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
+        
+        # Check if voice is available
+        if not VOICE_AVAILABLE:
+            return jsonify({'error': 'Voice processing not available'}), 503
+        
+        _, tts_available = voice_processor.is_voice_available()
+        if not tts_available:
+            return jsonify({'error': 'Text-to-speech not available'}), 503
+        
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        # Sanitize and validate text
+        text = sanitize_input(text, max_length=5000)
+        if not text:
+            return jsonify({'error': 'Invalid text format'}), 400
+        
+        # Validate session_id
+        session_id = data.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            return jsonify({'error': 'Invalid session ID format'}), 400
+        
+        # Synthesize speech
+        audio_bytes = voice_processor.synthesize_speech(text)
+        
+        if audio_bytes is None:
+            return jsonify({'error': 'Speech synthesis failed'}), 500
+        
+        # Log voice usage (HIPAA: metadata only, no PHI)
+        print(f"[Voice] TTS for session {session_id}: {len(text)} chars -> {len(audio_bytes)} bytes")
+        
+        # Return audio file
+        import io
+        audio_io = io.BytesIO(audio_bytes)
+        audio_io.seek(0)
+        
+        return send_file(
+            audio_io,
+            mimetype='audio/wav',
+            as_attachment=False,
+            download_name='speech.wav'
+        )
+    
+    except Exception as e:
+        print(f"[Voice] TTS error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/voice/status', methods=['GET'])
+def voice_status():
+    """Get voice processing system status"""
+    if not VOICE_AVAILABLE:
+        return jsonify({
+            'available': False,
+            'error': 'Voice processing not available'
+        })
+    
+    status = voice_processor.get_voice_status()
+    return jsonify(status)
+
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)
     # RAG system is initialized above based on process detection
@@ -1353,6 +1522,22 @@ if __name__ == '__main__':
             print("✅ MongoDB connected! Session data will be persisted.")
             print(f"   Database: {os.getenv('MONGODB_DB', 'healthyoda')}")
             print(f"   Collection: patient_sessions")
+        
+        # Voice status
+        if VOICE_AVAILABLE:
+            stt_ok, tts_ok = voice_processor.is_voice_available()
+            if stt_ok and tts_ok:
+                print("✅ Voice processing enabled! (STT + TTS)")
+            elif stt_ok:
+                print("⚠️  Voice processing partially enabled (STT only)")
+            elif tts_ok:
+                print("⚠️  Voice processing partially enabled (TTS only)")
+            else:
+                print("⚠️  Voice processing available but not initialized")
+                print("   Set VOICE_ENABLED=true in .env to enable")
+        else:
+            print("⚠️  Voice processing not available")
+            print("   Install: pip install faster-whisper piper-tts")
         
         print("-" * 50)
         app._startup_printed = True

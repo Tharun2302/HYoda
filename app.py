@@ -1678,6 +1678,72 @@ def voice_status():
     status = voice_processor.get_voice_status()
     return jsonify(status)
 
+@app.route('/healthbench/results', methods=['GET'])
+def get_healthbench_results():
+    """
+    API endpoint to get HealthBench evaluation results for dashboard.
+    
+    Query Parameters:
+        limit (int): Maximum number of results to return (default: 50)
+        
+    Returns:
+        JSON with evaluation results and statistics
+    """
+    try:
+        if not results_storage:
+            return jsonify({
+                'error': 'HealthBench evaluation not available',
+                'results': [],
+                'statistics': {}
+            }), 503
+        
+        # Get limit from query parameters
+        limit = request.args.get('limit', 50, type=int)
+        
+        # Get recent results
+        recent_results = results_storage.get_recent_evaluations(limit=limit)
+        
+        # Get statistics
+        statistics = results_storage.get_statistics()
+        
+        return jsonify({
+            'success': True,
+            'results': recent_results,
+            'statistics': statistics,
+            'total_count': len(recent_results)
+        })
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to retrieve HealthBench results: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': str(e),
+            'results': [],
+            'statistics': {}
+        }), 500
+
+
+@app.route('/healthbench/dashboard', methods=['GET'])
+def healthbench_dashboard():
+    """
+    Serve the HealthBench evaluation dashboard HTML page.
+    """
+    try:
+        # Serve the dashboard HTML file
+        dashboard_path = Path(__file__).parent / 'healthbench_dashboard.html'
+        
+        if not dashboard_path.exists():
+            return f"<h1>Dashboard not found</h1><p>Please ensure healthbench_dashboard.html exists in the HYoda folder.</p>", 404
+        
+        return send_file(dashboard_path)
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to serve dashboard: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"<h1>Error</h1><p>{str(e)}</p>", 500
+
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)
     # RAG system is initialized above based on process detection

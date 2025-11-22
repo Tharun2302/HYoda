@@ -4,7 +4,9 @@ from functools import wraps
 import json
 import time
 import os
+import sys
 import re
+from pathlib import Path
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -1699,6 +1701,11 @@ if __name__ == '__main__':
         else:
             print("[OK] Langfuse configured! Traces will be logged.")
             print(f"   Using Langfuse tracker module for observability")
+        
+        # Show HealthBench dashboard status
+        if results_storage:
+            print("[OK] HealthBench Dashboard: http://127.0.0.1:8002/healthbench/dashboard")
+            print("   View real-time evaluation scores and metrics")
         
         if not mongodb_connected:
             print("⚠️  MongoDB not connected. Session data will not be persisted.")

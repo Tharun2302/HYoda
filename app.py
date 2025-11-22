@@ -1754,6 +1754,117 @@ def healthbench_dashboard():
         traceback.print_exc()
         return f"<h1>Error</h1><p>{str(e)}</p>", 500
 
+@app.route('/', methods=['GET'])
+def index():
+    """
+    Landing page with links to chatbot and dashboard.
+    """
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>HealthYoda - Medical Chatbot System</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            .container {
+                max-width: 800px;
+                background: white;
+                padding: 60px 40px;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                text-align: center;
+            }
+            h1 {
+                font-size: 48px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                margin-bottom: 20px;
+            }
+            p {
+                color: #7f8c8d;
+                font-size: 18px;
+                margin-bottom: 40px;
+            }
+            .links {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 30px;
+            }
+            .link-card {
+                background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+                padding: 40px 30px;
+                border-radius: 15px;
+                text-decoration: none;
+                transition: transform 0.3s, box-shadow 0.3s;
+                border: 2px solid transparent;
+            }
+            .link-card:hover {
+                transform: translateY(-10px);
+                box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+                border-color: #667eea;
+            }
+            .link-card h2 {
+                font-size: 32px;
+                margin-bottom: 15px;
+            }
+            .link-card p {
+                color: #34495e;
+                font-size: 16px;
+                margin-bottom: 0;
+            }
+            .chatbot-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }
+            .chatbot-card h2, .chatbot-card p {
+                color: white;
+            }
+            .dashboard-card h2 {
+                color: #667eea;
+            }
+            @media (max-width: 768px) {
+                .links {
+                    grid-template-columns: 1fr;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🏥 HealthYoda</h1>
+            <p>AI-Powered Medical Interview Assistant with Real-Time Quality Evaluation</p>
+            
+            <div class="links">
+                <a href="/index.html" class="link-card chatbot-card">
+                    <h2>🤖 Chatbot</h2>
+                    <p>Start medical interview</p>
+                </a>
+                
+                <a href="/healthbench/dashboard" class="link-card dashboard-card">
+                    <h2>📊 Dashboard</h2>
+                    <p>View evaluation results</p>
+                </a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)
     # RAG system is initialized above based on process detection

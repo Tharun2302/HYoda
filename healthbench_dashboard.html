@@ -460,24 +460,36 @@
         const API_BASE = 'http://localhost:8002';
         
         async function loadEvaluations() {
+            console.log('[Dashboard] Loading evaluations...');
             try {
                 // Save current scroll position before refresh
                 savedScrollPosition = window.scrollY;
                 
                 const response = await fetch(`${API_BASE}/healthbench/results`);
-                const data = await response.json();
+                console.log('[Dashboard] API response status:', response.status);
                 
-                // Update statistics WITHOUT re-rendering entire page
-                updateStatistics(data.statistics);
+                if (!response.ok) {
+                    throw new Error(`API returned ${response.status}`);
+                }
+                
+                const data = await response.json();
+                console.log('[Dashboard] Data received:', {
+                    results: data.results?.length || 0,
+                    hasStats: !!data.statistics
+                });
+                
+                // Update statistics
+                updateStatistics(data.statistics || {});
                 
                 // Check if data actually changed before re-rendering
                 const currentDataStr = JSON.stringify(data.results);
                 if (!window.lastDataStr || window.lastDataStr !== currentDataStr) {
                     // Data changed, need to re-render
                     window.lastDataStr = currentDataStr;
+                    console.log('[Dashboard] Rendering evaluations...');
                     
                     // Display evaluations
-                    displayEvaluations(data.results);
+                    displayEvaluations(data.results || []);
                     
                     // Restore scroll position after rendering (only if user has scrolled)
                     if (userHasScrolled && savedScrollPosition > 0) {
@@ -490,12 +502,11 @@
                     }
                 } else {
                     // Data unchanged - don't re-render, just update stats
-                    // This prevents unnecessary scrolling
-                    console.log('Data unchanged, skipping re-render');
+                    console.log('[Dashboard] Data unchanged, skipping re-render');
                 }
                 
             } catch (error) {
-                console.error('Error loading evaluations:', error);
+                console.error('[Dashboard] Error loading evaluations:', error);
                 document.getElementById('evaluations-container').innerHTML = `
                     <div class="empty-state">
                         <div class="empty-state-icon">⚠️</div>
@@ -508,18 +519,24 @@
         }
         
         function updateStatistics(stats) {
-            document.getElementById('total-evals').textContent = 
-                stats.total_evaluations || 0;
-            document.getElementById('avg-score').textContent = 
-                (stats.average_score || 0).toFixed(3);
-            document.getElementById('avg-safety-score').textContent = 
-                (stats.average_safety_score || 0).toFixed(3);
-            document.getElementById('avg-helm-score').textContent = 
-                (stats.average_helm_score || 0).toFixed(2);
-            document.getElementById('high-score').textContent = 
-                (stats.highest_score || stats.max_score || 0).toFixed(3);
-            document.getElementById('low-score').textContent = 
-                (stats.lowest_score || stats.min_score || 0).toFixed(3);
+            console.log('[Dashboard] Updating statistics:', stats);
+            try {
+                document.getElementById('total-evals').textContent = 
+                    stats.total_evaluations || 0;
+                document.getElementById('avg-score').textContent = 
+                    (stats.average_score || 0).toFixed(3);
+                document.getElementById('avg-safety-score').textContent = 
+                    (stats.average_safety_score || 0).toFixed(3);
+                document.getElementById('avg-helm-score').textContent = 
+                    (stats.average_helm_score || 0).toFixed(2);
+                document.getElementById('high-score').textContent = 
+                    (stats.highest_score || stats.max_score || 0).toFixed(3);
+                document.getElementById('low-score').textContent = 
+                    (stats.lowest_score || stats.min_score || 0).toFixed(3);
+                console.log('[Dashboard] Statistics updated successfully');
+            } catch (error) {
+                console.error('[Dashboard] Error updating statistics:', error);
+            }
         }
         
         // Track which sessions are expanded

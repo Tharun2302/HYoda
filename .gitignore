@@ -32,3 +32,13 @@ desktop.ini
 *.tmp
 *.temp
 
+# Audio files (HIPAA compliance - no audio storage)
+*.wav
+*.mp3
+*.webm
+*.ogg
+*.m4a
+*.flac
+audio_temp/
+temp_audio/
+

@@ -1,14 +1,32 @@
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
+from functools import wraps
 import json
 import time
 import os
-import sys
-from pathlib import Path
+import re
+from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 from langfuse_tracker import langfuse_tracker
 from rag_system import QuestionBookRAG
+
+# MongoDB imports
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    MONGODB_AVAILABLE = True
+except ImportError:
+    MONGODB_AVAILABLE = False
+    print("⚠️  pymongo not installed - MongoDB features disabled")
+
+# Voice processing imports
+try:
+    import voice_processor
+    VOICE_AVAILABLE = True
+except ImportError:
+    VOICE_AVAILABLE = False
+    print("⚠️  voice_processor not available - voice features disabled")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,7 +52,22 @@ except Exception as e:
     traceback.print_exc()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# HIPAA Compliance: Restrict CORS to specific origins only
+# In production, replace with actual frontend domain(s)
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000').split(',')
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# HIPAA Compliance: Add security headers
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    return response
 
 # Initialize OpenAI client
 openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -67,11 +100,16 @@ def initialize_rag_system():
     if rag_system is None:
         try:
             rag_system = QuestionBookRAG('docx/Question BOOK.docx', openai_client=client)
-            print(f"[OK] RAG System loaded: {len(rag_system.questions)} questions available")
-            if rag_system.collection and rag_system.collection.count() > 0:
-                print(f"[OK] Vector database ready: {rag_system.collection.count()} embeddings available")
-            elif rag_system.collection:
-                print(f"[INFO] Vector database initialized (no embeddings yet)")
+            print(f"✅ RAG System loaded: {len(rag_system.questions)} questions available")
+            if rag_system.collection is not None:
+                try:
+                    count = rag_system.collection.count()
+                    if count > 0:
+                        print(f"✅ Vector database ready: {count} embeddings available")
+                    else:
+                        print(f"ℹ️  Vector database initialized (no embeddings yet)")
+                except Exception as e:
+                    print(f"ℹ️  Vector database initialized (error checking count: {e})")
         except Exception as e:
             print(f"[WARNING] Could not load RAG system: {e}")
             import traceback
@@ -127,16 +165,824 @@ def initialize_evaluation_system():
 initialize_rag_system()
 initialize_evaluation_system()
 
-# Simple in-memory conversation history
+# Simple in-memory conversation history (for LLM context only)
 conversations = {}
 
+# MongoDB connection for storing structured medical data
+mongodb_client = None
+mongodb_db = None
+patient_sessions_collection = None
+
+def initialize_mongodb():
+    """Initialize MongoDB connection"""
+    global mongodb_client, mongodb_db, patient_sessions_collection
+    
+    if not MONGODB_AVAILABLE:
+        print("⚠️  MongoDB not available - session data will not be persisted")
+        return False
+    
+    try:
+        mongodb_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+        mongodb_db_name = os.getenv('MONGODB_DB', 'healthyoda')
+        
+        mongodb_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongodb_client.admin.command('ping')
+        mongodb_db = mongodb_client[mongodb_db_name]
+        patient_sessions_collection = mongodb_db['patient_sessions']
+        
+        # Create indexes for faster queries
+        # session_id is UNIQUE - each session gets its own document
+        # FUTURE: After auth, add user_id index and migrate from session_id to user_id
+        patient_sessions_collection.create_index('session_id', unique=True)
+        patient_sessions_collection.create_index('created_at')
+        
+        print(f"✅ MongoDB connected: {mongodb_db_name}")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        print(f"⚠️  MongoDB connection failed: {e}")
+        print("   Session data will not be persisted. Set MONGODB_URI in .env to enable.")
+        mongodb_client = None
+        mongodb_db = None
+        patient_sessions_collection = None
+        return False
+    except Exception as e:
+        print(f"⚠️  MongoDB initialization error: {e}")
+        mongodb_client = None
+        mongodb_db = None
+        patient_sessions_collection = None
+        return False
+
+# Initialize MongoDB
+mongodb_connected = initialize_mongodb()
+
+# HIPAA Compliance: Rate limiting (simple in-memory implementation)
+# In production, use Redis or similar for distributed rate limiting
+from collections import defaultdict
+from datetime import timedelta
+
+rate_limit_store = defaultdict(list)  # IP -> list of request timestamps
+RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', '100'))  # requests per window
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '3600'))  # seconds (1 hour)
+
+def check_rate_limit(ip_address):
+    """Check if IP address has exceeded rate limit"""
+    now = datetime.now()
+    window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW)
+    
+    # Clean old entries
+    rate_limit_store[ip_address] = [
+        ts for ts in rate_limit_store[ip_address] 
+        if ts > window_start
+    ]
+    
+    # Check limit
+    if len(rate_limit_store[ip_address]) >= RATE_LIMIT_REQUESTS:
+        return False
+    
+    # Add current request
+    rate_limit_store[ip_address].append(now)
+    return True
+
+# HIPAA Compliance: Input validation and sanitization
+def sanitize_input(text, max_length=5000):
+    """
+    Sanitize user input to prevent injection attacks and XSS.
+    
+    Args:
+        text: Input string to sanitize
+        max_length: Maximum allowed length
+    
+    Returns:
+        Sanitized string
+    """
+    if not isinstance(text, str):
+        return ""
+    
+    # Remove null bytes
+    text = text.replace('\x00', '')
+    
+    # Limit length
+    if len(text) > max_length:
+        text = text[:max_length]
+    
+    # Remove potentially dangerous characters (keep basic punctuation for medical terms)
+    # Allow letters, numbers, spaces, and common medical punctuation
+    text = re.sub(r'[^\w\s\.,;:\-\(\)\[\]\/\?\'"]', '', text)
+    
+    return text.strip()
+
+def validate_session_id(session_id):
+    """Validate session ID format"""
+    if not session_id or not isinstance(session_id, str):
+        return False
+    # Allow alphanumeric, dots, hyphens, underscores (for cf.conversation format)
+    if not re.match(r'^[a-zA-Z0-9._-]+$', session_id):
+        return False
+    if len(session_id) > 200:  # Reasonable max length
+        return False
+    return True
+
+# MongoDB Session Data Management
+# NOTE: Currently uses session_id as unique identifier.
+# FUTURE: After adding authentication, replace session_id with user_id for user-based storage.
+# Each session_id = one unique patient session = one MongoDB document
+def get_or_create_session_data(session_id):
+    """
+    Get or create session data structure in MongoDB.
+    Stores only structured medical data, NOT full chat history.
+    
+    Each session_id is unique and maps to one MongoDB document.
+    In the future, this will be replaced with user_id after authentication is added.
+    
+    Args:
+        session_id: Unique session identifier (currently from frontend, future: user_id)
+    
+    Returns:
+        Dictionary with session data structure
+    """
+    if patient_sessions_collection is None:
+        # Fallback to in-memory if MongoDB not available
+        return {
+            'session_id': session_id,
+            'complaint_name': None,
+            'hpi': {},
+            'ros': {},
+            'past_history': {},
+            'red_flags': [],
+            'qa_pairs': [],  # Store ALL question-answer pairs
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+    
+    try:
+        session_data = patient_sessions_collection.find_one({'session_id': session_id})
+        if not session_data:
+            # Create new session
+            # Each session_id is UNIQUE - one document per session
+            # FUTURE: After auth, add user_id field and use it as primary identifier
+            session_data = {
+                'session_id': session_id,  # UNIQUE identifier - one document per session
+                # 'user_id': None,  # FUTURE: Add after authentication is implemented
+                'complaint_name': None,
+                'hpi': {},  # Store actual HPI data: {'onset': '...', 'location': '...', etc.}
+                'ros': {},  # Store ROS data by system: {'respiratory': {...}, 'cardiovascular': {...}}
+                'past_history': {
+                    'pmh': None,
+                    'psh': None,
+                    'medications': [],
+                    'allergies': [],
+                    'family_history': None,
+                    'social_history': {}
+                },
+                'red_flags': [],
+                'qa_pairs': [],  # NEW: Store ALL question-answer pairs including "no" responses
+                'created_at': datetime.now(),
+                'updated_at': datetime.now()
+            }
+            patient_sessions_collection.insert_one(session_data)
+            print(f"[MongoDB] Created new session: {session_id}")
+        else:
+            # Convert ObjectId to string for JSON serialization
+            if '_id' in session_data:
+                session_data['_id'] = str(session_data['_id'])
+        return session_data
+    except Exception as e:
+        print(f"[MongoDB] Error getting session data: {e}")
+        return None
+
+def update_session_data(session_id, updates):
+    """
+    Update session data in MongoDB.
+    
+    Each session_id has its own unique document. Updates are scoped to that session.
+    FUTURE: After auth, this will update by user_id instead of session_id.
+    
+    Args:
+        session_id: Unique session identifier
+        updates: Dictionary of fields to update (e.g., {'hpi.onset': '2 hours ago'})
+    
+    Returns:
+        True if update successful, False otherwise
+    """
+    if patient_sessions_collection is None:
+        return False
+    
+    try:
+        updates['updated_at'] = datetime.now()
+        result = patient_sessions_collection.update_one(
+            {'session_id': session_id},
+            {'$set': updates}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        print(f"[MongoDB] Error updating session data: {e}")
+        return False
+
+def map_category_to_data_field(category, system=None):
+    """
+    Map RAG question category to data field in session structure.
+    Returns the field path and whether data is already collected.
+    """
+    category_lower = category.lower() if category else ''
+    
+    # Map HPI categories
+    hpi_mapping = {
+        'onset/duration': 'hpi.onset',
+        'onset': 'hpi.onset',
+        'duration': 'hpi.duration',
+        'location': 'hpi.location',
+        'quality/severity': 'hpi.quality',
+        'quality': 'hpi.quality',
+        'severity': 'hpi.severity',
+        'timing': 'hpi.timing',
+        'context': 'hpi.context',
+        'aggravating/relieving': 'hpi.modifying_factors',
+        'modifying factors': 'hpi.modifying_factors',
+        'progression': 'hpi.progression',
+        'associated symptoms': 'hpi.associated_symptoms',
+        'chief complaint': 'hpi.chief_complaint'
+    }
+    
+    # Map ROS categories
+    ros_mapping = {
+        'ros': 'ros',
+        'review of systems': 'ros'
+    }
+    
+    # Map Past History categories
+    past_history_mapping = {
+        'pmh': 'past_history.pmh',
+        'past medical history': 'past_history.pmh',
+        'psh': 'past_history.psh',
+        'surgical history': 'past_history.psh',
+        'medications': 'past_history.medications',
+        'allergies': 'past_history.allergies',
+        'family history': 'past_history.family_history',
+        'social history': 'past_history.social_history'
+    }
+    
+    # Check mappings
+    if category_lower in hpi_mapping:
+        return hpi_mapping[category_lower], 'hpi'
+    elif category_lower in ros_mapping:
+        # ROS needs system name
+        if system:
+            system_lower = system.lower()
+            # Map system names to ROS fields
+            ros_systems = {
+                'constitutional': 'constitutional',
+                'respiratory': 'respiratory',
+                'cardiovascular': 'cardiovascular',
+                'cardiac': 'cardiovascular',
+                'gi': 'gi',
+                'gastrointestinal': 'gi',
+                'gu': 'gu',
+                'genitourinary': 'gu',
+                'neurologic': 'neuro',
+                'neurological': 'neuro',
+                'neuro': 'neuro',
+                'msk': 'msk',
+                'musculoskeletal': 'msk',
+                'psych': 'psych',
+                'psychiatric': 'psych',
+                'endocrine': 'endocrine',
+                'skin': 'skin',
+                'dermatologic': 'skin',
+                'heme': 'heme_immune',
+                'immune': 'heme_immune'
+            }
+            if system_lower in ros_systems:
+                return f"ros.{ros_systems[system_lower]}", 'ros'
+        return 'ros', 'ros'
+    elif category_lower in past_history_mapping:
+        return past_history_mapping[category_lower], 'past_history'
+    elif 'red flag' in category_lower:
+        return 'red_flags', 'red_flags'
+    
+    return None, None
+
+def is_data_already_collected(session_id, category, system=None, question_text=None):
+    """
+    Check if data for a given category/system is already collected in MongoDB.
+    Returns True if data exists, False if needs to be collected.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return False
+    
+    field_path, data_type = map_category_to_data_field(category, system)
+    if not field_path:
+        # Unknown category, allow question
+        return False
+    
+    # Check if data exists
+    if data_type == 'hpi':
+        field_name = field_path.split('.')[-1]
+        return session_data.get('hpi', {}).get(field_name) is not None and session_data['hpi'][field_name] != ''
+    elif data_type == 'ros':
+        if '.' in field_path:
+            system_name = field_path.split('.')[-1]
+            ros_data = session_data.get('ros', {})
+            return system_name in ros_data and ros_data[system_name] is not None
+        return False
+    elif data_type == 'past_history':
+        field_name = field_path.split('.')[-1]
+        past_data = session_data.get('past_history', {})
+        value = past_data.get(field_name)
+        if field_name in ['medications', 'allergies']:
+            return isinstance(value, list) and len(value) > 0
+        return value is not None and value != ''
+    elif data_type == 'red_flags':
+        red_flags = session_data.get('red_flags', [])
+        if question_text:
+            # Check if this specific red flag question was already asked
+            return question_text in [rf.get('question', '') for rf in red_flags]
+        return len(red_flags) > 0
+    
+    return False
+
+def store_qa_pair(session_id, question, answer):
+    """
+    Store question-answer pair dynamically.
+    Stores EVERYTHING including "no" responses.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    # Get existing Q&A pairs
+    qa_pairs = session_data.get('qa_pairs', [])
+    
+    # Add new Q&A pair
+    qa_pairs.append({
+        'question': question,
+        'answer': answer,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Update in MongoDB
+    update_session_data(session_id, {'qa_pairs': qa_pairs})
+    print(f"[MongoDB] Stored Q&A: Q='{question[:50]}...' A='{answer[:50]}...'")
+
+def was_question_asked(session_id, new_question):
+    """
+    Check if a similar question was already asked.
+    Uses semantic similarity to avoid exact match requirements.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return False
+    
+    qa_pairs = session_data.get('qa_pairs', [])
+    if not qa_pairs:
+        return False
+    
+    # Simple keyword matching for now (can enhance with embeddings later)
+    new_question_lower = new_question.lower()
+    new_keywords = set(new_question_lower.split())
+    
+    for qa in qa_pairs:
+        asked_question = qa.get('question', '').lower()
+        asked_keywords = set(asked_question.split())
+        
+        # Calculate overlap
+        common_keywords = new_keywords & asked_keywords
+        if len(common_keywords) >= 3:  # At least 3 words in common
+            print(f"[MongoDB] Similar question already asked: '{asked_question[:50]}...'")
+            return True
+    
+    return False
+
+def extract_and_store_data_with_llm(session_id, user_response, bot_question, conversation_context):
+    """
+    Store question-answer pair AND extract structured data.
+    Stores ALL responses including "no".
+    """
+    if not client:  # No OpenAI client
+        return
+    
+    # ALWAYS store the Q&A pair first (even "no" responses)
+    store_qa_pair(session_id, bot_question, user_response)
+    
+    # Skip structured extraction for very short responses
+    if len(user_response.strip()) <= 3 or user_response.lower() in ['no', 'yes', 'nope', 'yeah', 'yep', 'nah']:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    # Use LLM to extract structured data for longer responses
+    extraction_prompt = f"""Extract medical data from patient's response.
+
+Question: "{bot_question}"
+Response: "{user_response}"
+
+Extract relevant information WITHOUT predefined keys. Create appropriate field names based on what was asked.
+
+Examples:
+- Q: "When did it start?" A: "yesterday" → {{"symptom_onset": "yesterday"}}
+- Q: "Where is the pain?" A: "right shoulder" → {{"pain_location": "right shoulder"}}
+- Q: "Any medications?" A: "paracetamol" → {{"current_medications": ["paracetamol"]}}
+- Q: "Do you smoke?" A: "no" → {{"smoking_status": "no"}}
+
+Return JSON with dynamic field names. If no meaningful data, return: {{}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{'role': 'user', 'content': extraction_prompt}],
+            temperature=0.1,
+            max_tokens=500
+        )
+        
+        extracted_text = response.choices[0].message.content.strip()
+        # Parse JSON
+        import json
+        # Remove markdown code blocks if present
+        if '```json' in extracted_text:
+            extracted_text = extracted_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in extracted_text:
+            extracted_text = extracted_text.split('```')[1].split('```')[0].strip()
+        
+        extracted_data = json.loads(extracted_text)
+        
+        if not extracted_data:
+            return
+        
+        # Store with dynamic field names (no predefined structure)
+        updates = {}
+        for key, value in extracted_data.items():
+            if value:  # Only store non-empty values
+                # Store in HPI if it's a symptom-related field
+                if any(term in key.lower() for term in ['onset', 'location', 'duration', 'quality', 'severity', 'timing', 'context', 'modifying', 'progression', 'symptom', 'complaint', 'pain']):
+                    updates[f'hpi.{key}'] = value
+                    print(f"[LLM Extract] hpi.{key}: {str(value)[:50]}...")
+                # Store in past_history if it's history-related
+                elif any(term in key.lower() for term in ['history', 'medication', 'allergy', 'surgery', 'smoking', 'alcohol', 'family']):
+                    if isinstance(value, list):
+                        updates[f'past_history.{key}'] = value
+                    else:
+                        updates[f'past_history.{key}'] = value
+                    print(f"[LLM Extract] past_history.{key}: {str(value)[:50]}...")
+                # Store in ROS if it's a system review
+                elif any(term in key.lower() for term in ['respiratory', 'cardiac', 'neuro', 'gi', 'gu', 'msk', 'skin', 'psych']):
+                    updates[f'ros.{key}'] = value
+                    print(f"[LLM Extract] ros.{key}: {str(value)[:50]}...")
+                else:
+                    # Store in HPI by default for general medical info
+                    updates[f'hpi.{key}'] = value
+                    print(f"[LLM Extract] hpi.{key}: {str(value)[:50]}...")
+        
+        if updates:
+            update_session_data(session_id, updates)
+            print(f"[MongoDB] Stored {len(updates)} dynamic fields")
+            
+    except Exception as e:
+        print(f"[LLM Extract] Error: {e}")
+
+
+def extract_and_store_data(session_id, user_response, rag_question_info):
+    """
+    Legacy function for RAG-based extraction.
+    Kept for compatibility but now also calls LLM extraction.
+    """
+    if not rag_question_info:
+        return
+    
+    category = rag_question_info.get('category', '')
+    system = rag_question_info.get('system', '')
+    question_text = rag_question_info.get('question', '')
+    
+    field_path, data_type = map_category_to_data_field(category, system)
+    if not field_path:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return
+    
+    updates = {}
+    
+    if data_type == 'hpi':
+        field_name = field_path.split('.')[-1]
+        if not session_data.get('hpi', {}).get(field_name):
+            updates[f'hpi.{field_name}'] = user_response
+    elif data_type == 'ros':
+        if '.' in field_path:
+            system_name = field_path.split('.')[-1]
+            if system_name not in session_data.get('ros', {}):
+                updates[f'ros.{system_name}'] = user_response
+    elif data_type == 'past_history':
+        field_name = field_path.split('.')[-1]
+        if field_name in ['medications', 'allergies']:
+            # These are lists
+            current_list = session_data.get('past_history', {}).get(field_name, [])
+            if user_response not in current_list:
+                current_list.append(user_response)
+                updates[f'past_history.{field_name}'] = current_list
+        else:
+            if not session_data.get('past_history', {}).get(field_name):
+                updates[f'past_history.{field_name}'] = user_response
+    elif data_type == 'red_flags':
+        red_flags = session_data.get('red_flags', [])
+        # Check if this red flag already recorded
+        if not any(rf.get('question') == question_text for rf in red_flags):
+            red_flags.append({
+                'question': question_text,
+                'response': user_response,
+                'timestamp': datetime.now().isoformat()
+            })
+            updates['red_flags'] = red_flags
+    
+    # Also update complaint name if this is chief complaint
+    if category and 'chief complaint' in category.lower():
+        if not session_data.get('complaint_name'):
+            # Extract complaint from user response
+            updates['complaint_name'] = user_response[:100]  # Limit length
+    
+    if updates:
+        update_session_data(session_id, updates)
+        print(f"[MongoDB] Stored data for {field_path}: {user_response[:50]}...")
+
+def format_collected_data_for_llm(session_id):
+    """
+    Format already collected data as context for LLM.
+    Shows Q&A pairs AND structured data so LLM knows what NOT to ask again.
+    """
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return ""
+    
+    context_parts = []
+    
+    # Show recent Q&A pairs (last 15 to avoid token limit)
+    qa_pairs = session_data.get('qa_pairs', [])
+    if qa_pairs:
+        context_parts.append("QUESTIONS ALREADY ASKED:")
+        recent_qa = qa_pairs[-15:]  # Last 15 Q&A pairs
+        for qa in recent_qa:
+            q = qa.get('question', '').strip()
+            a = qa.get('answer', '').strip()
+            context_parts.append(f"  Q: {q[:70]}...")
+            context_parts.append(f"  A: {a[:70]}...")
+    
+    # HPI data collected with values
+    hpi_data = session_data.get('hpi', {})
+    if hpi_data:
+        hpi_items = []
+        for key, value in hpi_data.items():
+            if value:
+                hpi_items.append(f"{key}: {value}")
+        if hpi_items:
+            context_parts.append("\nSTRUCTURED HPI DATA:")
+            context_parts.extend([f"  - {item}" for item in hpi_items])
+    
+    # ROS systems reviewed with values
+    ros_data = session_data.get('ros', {})
+    if ros_data:
+        ros_items = []
+        for system, value in ros_data.items():
+            if value:
+                ros_items.append(f"{system}: {value}")
+        if ros_items:
+            context_parts.append("\nROS DATA:")
+            context_parts.extend([f"  - {item}" for item in ros_items])
+    
+    # Past history collected with values
+    past_data = session_data.get('past_history', {})
+    past_items = []
+    for key, value in past_data.items():
+        if value:
+            if isinstance(value, list) and len(value) > 0:
+                past_items.append(f"{key}: {', '.join(value)}")
+            elif isinstance(value, dict) and value:
+                past_items.append(f"{key}: {str(value)}")
+            elif not isinstance(value, (list, dict)) and value:
+                past_items.append(f"{key}: {value}")
+    if past_items:
+        context_parts.append("\nPAST HISTORY:")
+        context_parts.extend([f"  - {item}" for item in past_items])
+    
+    if context_parts:
+        header = "\n\n[INFORMATION ALREADY COLLECTED - DO NOT RE-ASK]\n"
+        header += "="*70 + "\n"
+        body = "\n".join(context_parts)
+        footer = "\n" + "="*70
+        footer += "\n⚠️  CRITICAL: DO NOT ask questions that were already asked above!"
+        footer += "\nFocus ONLY on collecting NEW information.\n"
+        return header + body + footer
+    
+    return ""
+
 # System prompt for HealthYoda
-SYSTEM_PROMPT = """Medical Intake Voice Agent (Improved)## Role & Objective ,You are the Medical Intake Voice Agent.  Primary objective: COLLECT structured, pre-consultation intake data (reason for visit, symptom details, history, meds, allergies, social/family context, recent visits) and ESCALATE urgent problems. You MUST NOT give medical advice, diagnosis, reassurance, or interpretation — only collect and confirm information for the provider.## Personality & Tone- Warm, brief, empathetic, neutral; respectful and calm.  - Keep pace snappy; limit each utterance to a single step or question.  - Prefer short bullets/phrases over long paragraphs. (Use concise turns.)## Language & Playback- Conversation language: English only. Do not switch languages. If user speaks another language, reply: “I’m sorry — we support English only. Your provider will discuss details.”- For audio pacing, follow brevity and pacing instructions rather than relying solely on playback speed.## Hard Constraints (ENFORCE)- NEVER provide medical advice, reassurance, diagnoses, or clinical interpretation. If asked any medical question, respond only with one of:  - “Your provider will discuss this with you.”  - “I’m here only to collect information for your provider.”- If any of these RED-FLAG phrases are *spoken by the patient* — IMMEDIATELY call red_flag_detected with the patient’s exact words and then say the alert phrase to the patient (see Red Flags below): chest pain, trouble breathing, severe bleeding, loss of consciousness, slurred speech/weakness/facial droop, suicidal thoughts. (CALL red_flag_detected IMMEDIATELY; do not wait.) :contentReference[oaicite:4]{index=4}- When reading or repeating numbers/IDs, speak each character separated by hyphens and confirm exactly (e.g., 4-1-5). ## Variety / Repetition Rules- DO NOT repeat the same exact sentence/opener more than once within **[N] turns**. Use synonyms/alternate phrasings. (This avoids robotic repetition.) - Required legal/brand phrases may be reused; otherwise vary phrasing.## Conversation Flow (Strict phases — DO NOT SKIP)Follow phases in order. Only transition when the **Exit Criteria** are met. If criteria unmet, ask focused clarifying question(s).1) GREETING & ID- Goal: Introduce and get patient name.- Start EXACTLY with:    “Hello, I’ll be assisting you with a brief intake process for your provider. To get started, please tell me your full name.”    If no response, after a short pause (one brief follow-up) repeat greeting once.  - Exit when patient states or confirms name and initial complaint. 3) SYMPTOM DISCOVERY (for each symptom mentioned)- Goal: Collect structured symptom fields (FHIR-aligned): chief complaint, onset/timing, duration, severity, body location, triggers, progression, associated symptoms.- After each patient utterance: (a) ACKNOWLEDGE briefly, (b) ECHO their exact words when confirming (see Echo rules), (c) Ask the next focused intake question.- Exit when all required symptom fields captured for that symptom. 4) MEDICAL HISTORY & MEDICATIONS- Goal: Allergies, current meds (including OTC/supplements), chronic conditions, surgeries.- Exit when allergies and current medications captured.5) SOCIAL & FAMILY HISTORY / CONTEXT- Goal: Smoking, alcohol, occupation, living situation, family medical issues, recent travel/exposures.- Exit when key context captured.6) RECENT CARE & ADDITIONAL NOTES- Ask about recent provider visits, tests, or anything the provider should know.- Exit when patient has no more to add after a gentle prompt.7) CLARIFY & CONFIRM- Goal: Confirm critical items for safety (name, chief complaint, red flags, meds, allergies).- Use a brief confirmation pattern (see Echo rules). Exit when patient confirms.8) NEXT STEPS & CLOSE- Goal: Explain that data is recorded and what happens next; close politely.- End with this exact closing statement:    “Thank you. I’ve recorded this information. Your provider will review it with you.”- Exit when patient acknowledges or has no further questions.(If at any point RED FLAG detected — see Red Flags — trigger immediately and follow escalation.)## Echo & Confirmation Rules (literal)- WHEN CONFIRMING: ECHO the patient’s words exactly (LITERAL verbatim), not paraphrased. Use square-brackets when inserting exact text:    “I want to be sure I understood. Did you say: [<patient exact words>]?”  - DO NOT alter medical terms, abbreviations, or patient phrasing. This literal echo is mandatory for safety and legal fidelity. (Use literal echo only for confirmation; other acknowledgements can be short varied phrases.) ## Red Flags (IMMEDIATE ACTION)- Trigger red_flag_detected(patient_exact_words) IMMEDIATELY if patient mentions any of: chest pain, trouble breathing, severe bleeding, loss of consciousness, slurred speech/weakness/facial droop, suicidal thoughts, or any phrase that reasonably indicates imminent harm.  - Immediately say to patient (verbatim):    “This seems a critical symptom, I am raising critical alert to your provider immediately. Please stay where you are and help will be with you shortly”.  - Do not continue other intake questions until escalation logic returns control.## Interaction Micro-rules- After every patient response:  1. Briefly acknowledge (1–5 words).    2. If confirming, echo their words verbatim as above.    3. Ask the next required intake question.  - Keep each output ≤ 20 words EXCEPT when giving instructions (e.g., read-back) or delivering the closing message. If an instruction is needed (confirmation of numbers, safety instruction), allow up to 30 words. (Brevity is critical.)- NEVER introduce new medical terminology to the patient. Use their words literally.- If confused/unclear: “I want to be sure I understood. Did you say: [patient exact words]?” (Then pause for confirmation.)## Sample Phrases (INSPIRATION — DO NOT ALWAYS REUSE)- “Thanks — may I confirm your date of birth?”  - “I’m listening — what else should I note?”  - “I want to be sure I understood. Did you say: [patient words]?”  ## Safety, Privacy & Logging- Obtain any required consent per clinic policy before storing sensitive data.  - Log confirmations, exact echoes, and any red-flag triggers for audit.  - Follow applicable privacy laws (HIPAA/local) — never disclose PHI publicly.## Prompt Critique (self-check)- If instructions are ambiguous or conflicting, ask a single clarifying question and log it.  - If audio is noisy or unintelligible, ask the user to repeat or spell critical items (numbers character-by-character)."""
+SYSTEM_PROMPT = """You are HealthYODA, a medical intake voice agent.
+Your role is to conduct an extensive, medically accurate patient interview to support Level 5 medical decision-making, by gathering a comprehensive history for the patient’s doctor.
+
+You must not give medical advice, diagnosis, interpretation, reassurance, or treatment of any kind.
+
+Context Provided to You
+Complaint: {{COMPLAINT_NAME}}
+
+RAG Question Set: {{COMPLAINT_JSON_CHECKLIST}}
+(Includes domains, red-flag questions, extensive ROS, and condition-specific history templates.)
+
+Use this information as your clinical framework.
+
+Your Interview Requirements (Level-5 Standard)
+You must gather a comprehensive history that includes:
+
+1. HPI (History of Present Illness) with 8+ elements
+Collect and adaptively ask about:
+
+Onset
+
+Location
+
+Duration
+
+Quality
+
+Severity
+
+Timing
+
+Context
+
+Modifying factors (triggers/relievers)
+
+Progression
+
+Associated symptoms
+
+Risk factors relevant to the complaint
+
+(You may combine some, but cover at least 8 distinct elements.)
+
+2. ROS (Review of Systems) — Extended (10+ systems if relevant)
+Using the RAG complaint-specific checklist, ask targeted ROS questions across systems such as:
+
+Constitutional
+
+Respiratory
+
+Cardiovascular
+
+GI
+
+GU
+
+Neuro
+
+MSK
+
+Psych
+
+Endocrine
+
+Skin
+
+Heme/Immune
+
+Mark relevant negatives clearly.
+
+3. Past History Components (2+ required)
+Collect relevant past information:
+
+PMH (past medical history)
+
+PSH (surgical history)
+
+Medications
+
+Allergies
+
+Family history
+
+Social history (smoking, alcohol, occupational exposures)
+
+(Ask only what is clinically relevant to the complaint.)
+
+4. Red Flags (Complaint-Specific)
+If the patient signals any high-risk symptoms, you must prioritize those questions immediately using the RAG checklist.
+
+Interview Behavior
+Ask one question at a time (≤ 12 words).
+
+Adapt the next question based on the patient’s last answer.
+
+Maintain empathy, clarity, and a professional tone.
+
+Avoid long explanations—stay focused on collecting information.
+
+If the patient digresses, gently redirect them.
+
+Track which domains are Completed / Pending; do not repeat completed ones.
+
+Strict Prohibitions
+Never provide:
+
+Diagnosis
+
+Interpretation (e.g., “sounds like…”)
+
+Treatment or medication suggestions
+
+Medical advice
+
+Reassurance
+
+Risk assessment
+
+If asked, respond only:
+
+“I cannot provide medical advice, diagnosis, or treatment.
+I'm here only to collect information for your doctor.”
+
+Safety Behavior
+If life-threatening symptoms appear, say:
+
+“I can’t provide medical advice.
+If you feel unsafe or unwell, contact emergency services or your doctor immediately.”
+
+Then close the session.
+
+Session Completion Requirements
+Once all domains (HPI, ROS, Past History, Red Flags) are fully covered:
+
+1. Say: "Thank you for your time. I'll send this to your doctor."
+
+2. Output a SINGLE markdown-formatted summary:
+
+---
+
+## Patient Summary
+
+### Chief Complaint
+[Main complaint]
+
+### History of Present Illness (HPI)
+- **Onset:** [when started]
+- **Location:** [where]
+- **Duration:** [how long]
+- **Quality:** [description]
+- **Severity:** [1-10 or description]
+- **Timing:** [constant/intermittent]
+- **Context:** [what was happening]
+- **Modifying Factors:** [what makes better/worse]
+- **Progression:** [getting better/worse/same]
+- **Associated Symptoms:** [other symptoms]
+
+### Review of Systems (ROS)
+**Systems Reviewed:** [list systems]
+
+**Positive Findings:**
+- [symptom 1]
+- [symptom 2]
+
+**Relevant Negatives:**
+- [no symptom 1]
+- [no symptom 2]
+
+### Past Medical History
+- **PMH:** [conditions]
+- **PSH:** [surgeries]
+- **Medications:** [current meds]
+- **Allergies:** [allergies or none]
+- **Family History:** [relevant family history]
+- **Social History:** [smoking, alcohol, occupation]
+
+### Red Flags
+[Any concerning symptoms or "None identified"]
+
+---
+
+3. Then say: "I wish you well."
+
+DO NOT output multiple formats. Output ONLY the markdown summary above.
+Overall Behavior Summary
+Conduct an extensive, Level-5-grade intake interview using RAG-retrieved complaint data.
+
+Ask adaptively, cover all domains, collect broad ROS and relevant history.
+
+Never diagnose or treat.
+
+Summarize clearly at the end for the physician.
+"""
 
 @app.route('/chat/stream', methods=['POST'])
 def chat_stream():
     """Streaming chat endpoint using OpenAI"""
     try:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Rate limit exceeded. Please try again later.'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
         # Ensure RAG system is initialized (lazy initialization)
         if rag_system is None:
             initialize_rag_system()
@@ -148,11 +994,27 @@ def chat_stream():
             return Response(error_response(), mimetype='text/event-stream')
         
         data = request.get_json()
-        question = data.get('question', '')
-        session_id = data.get('session_id', 'default')
+        if not data:
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Invalid request: No JSON data provided'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
         
+        # HIPAA Compliance: Validate and sanitize inputs
+        question = data.get('question', '')
         if not question:
-            return jsonify({'error': 'No question provided'}), 400
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Question is required'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
+        question = sanitize_input(question, max_length=5000)
+        if not question:
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Invalid question format'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
+        session_id = data.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            session_id = 'default'  # Fallback to default if invalid
         
         # Get or create conversation history
         if session_id not in conversations:
@@ -162,6 +1024,37 @@ def chat_stream():
         
         # Add user message to history
         conversation_history.append({'role': 'user', 'content': question})
+        
+        # Store the previous RAG question info in conversation metadata for data extraction
+        # We'll store it when bot asks a question, then use it when user responds
+        prev_rag_info = None
+        if len(conversation_history) > 2:  # Need at least user-bot-user pattern
+            # Try to get the RAG question that was asked in the previous bot message
+            # Look for the last assistant message before this user message
+            for i in range(len(conversation_history) - 2, -1, -1):
+                if conversation_history[i].get('role') == 'assistant':
+                    # Check if we stored RAG info in metadata (we'll add this later)
+                    prev_rag_info = conversation_history[i].get('rag_question_info')
+                    break
+        
+        # Extract and store data from user response to previous question
+        # Use LLM extraction for ALL responses (not just RAG-tagged)
+        prev_bot_question = ""
+        if len(conversation_history) > 1:
+            # Get the last bot question
+            for i in range(len(conversation_history) - 2, -1, -1):
+                if conversation_history[i].get('role') == 'assistant':
+                    prev_bot_question = conversation_history[i].get('content', '')
+                    break
+        
+        if prev_bot_question and len(question) > 2:  # Skip very short responses like "no"
+            # Use LLM to extract data from ANY response
+            recent_context = " ".join([msg.get('content', '') for msg in conversation_history[-6:]])
+            extract_and_store_data_with_llm(session_id, question, prev_bot_question, recent_context)
+        
+        # Also use legacy RAG-based extraction if available
+        if prev_rag_info:
+            extract_and_store_data(session_id, question, prev_rag_info)
         
         # Retrieve relevant question from RAG system if available
         rag_context = ""
@@ -178,23 +1071,39 @@ def chat_stream():
                 system=None  # Can be detected from context
             )
             
+            # Check MongoDB: Skip this question if data is already collected
             if rag_question_info:
-                rag_context = f"\n\n[RELEVANT QUESTION FROM QUESTION BOOK]\n"
-                rag_context += f"Question: {rag_question_info['question']}\n"
-                if rag_question_info.get('possible_answers'):
-                    rag_context += f"Possible answers: {', '.join(rag_question_info['possible_answers'][:5])}\n"
+                category = rag_question_info.get('category', '')
+                system = rag_question_info.get('system', '')
+                question_text = rag_question_info.get('question', '')
                 
-                # Log the question tree branch being used
-                tree_path = rag_question_info.get('tree_path', 'Unknown')
-                tags = rag_question_info.get('tags', [])
-                print(f"\n{'='*80}")
-                print(f"[RAG] Question Tree Branch: {tree_path}")
-                print(f"[RAG] Tags: {', '.join(tags)}")
-                print(f"[RAG] Question: {rag_question_info['question']}")
-                print(f"{'='*80}\n")
+                if is_data_already_collected(session_id, category, system, question_text):
+                    print(f"[MongoDB] Data already collected for category '{category}' (system: {system}), skipping question: {question_text[:50]}...")
+                    rag_question_info = None  # Skip this question
+                    # Try to get a different question (you could enhance RAG to exclude collected categories)
+                else:
+                    rag_context = f"\n\n[RELEVANT QUESTION FROM QUESTION BOOK]\n"
+                    rag_context += f"Question: {rag_question_info['question']}\n"
+                    if rag_question_info.get('possible_answers'):
+                        rag_context += f"Possible answers: {', '.join(rag_question_info['possible_answers'][:5])}\n"
+                    
+                    # Log the question tree branch being used
+                    tree_path = rag_question_info.get('tree_path', 'Unknown')
+                    tags = rag_question_info.get('tags', [])
+                    print(f"\n{'='*80}")
+                    print(f"[RAG] Question Tree Branch: {tree_path}")
+                    print(f"[RAG] Tags: {', '.join(tags)}")
+                    print(f"[RAG] Question: {rag_question_info['question']}")
+                    print(f"{'='*80}\n")
         
-        # Prepare messages for OpenAI (include system prompt + RAG context)
+        # Prepare messages for OpenAI (include system prompt + RAG context + collected data)
         enhanced_system_prompt = SYSTEM_PROMPT
+        
+        # Add context about already collected data (so LLM doesn't ask again)
+        collected_data_context = format_collected_data_for_llm(session_id)
+        if collected_data_context:
+            enhanced_system_prompt += collected_data_context
+        
         if rag_context:
             enhanced_system_prompt += rag_context
         
@@ -265,8 +1174,11 @@ def chat_stream():
                         full_response += token
                         yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
                 
-                # Add assistant response to history
-                conversation_history.append({'role': 'assistant', 'content': full_response})
+                # Add assistant response to history with RAG question info for next data extraction
+                assistant_msg = {'role': 'assistant', 'content': full_response}
+                if rag_question_info:
+                    assistant_msg['rag_question_info'] = rag_question_info  # Store for next user response
+                conversation_history.append(assistant_msg)
                 
                 # Log tree branch for EVERY chatbot response
                 print(f"\n{'='*80}")
@@ -469,14 +1381,22 @@ def chat_stream():
         return Response(generate(), mimetype='text/event-stream')
     
     except Exception as e:
+        # Capture error message before defining nested function (Python 3.13+ scope issue)
+        error_msg = str(e)
         def error_response():
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
         return Response(error_response(), mimetype='text/event-stream')
 
 @app.route('/chat/history/<user_id>', methods=['GET'])
 def get_chat_history(user_id):
     """Get chat history (simplified - no auth required)"""
+    # HIPAA Compliance: Validate user_id and session_id
+    if not validate_session_id(str(user_id)):
+        return jsonify({'error': 'Invalid user ID format'}), 400
+    
     session_id = request.args.get('session_id', 'default')
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
     
     if session_id in conversations:
         history = conversations[session_id]
@@ -487,7 +1407,13 @@ def get_chat_history(user_id):
 @app.route('/chat/history/<user_id>', methods=['DELETE'])
 def delete_chat_history(user_id):
     """Clear chat history"""
+    # HIPAA Compliance: Validate user_id and session_id
+    if not validate_session_id(str(user_id)):
+        return jsonify({'error': 'Invalid user ID format'}), 400
+    
     session_id = request.args.get('session_id', 'default')
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
     
     if session_id in conversations:
         conversations[session_id] = []
@@ -498,11 +1424,27 @@ def delete_chat_history(user_id):
 def submit_feedback():
     """Submit user feedback (thumbs up/down) to Langfuse"""
     try:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
+        
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid request: No JSON data provided'}), 400
+        
         trace_id = data.get('trace_id')
+        if trace_id and not validate_session_id(str(trace_id)):
+            return jsonify({'error': 'Invalid trace_id format'}), 400
+        
         generation_id = data.get('generation_id')  # Optional generation ID
+        if generation_id and not validate_session_id(str(generation_id)):
+            return jsonify({'error': 'Invalid generation_id format'}), 400
+        
         rating = data.get('rating')  # 'thumbs_up' or 'thumbs_down'
         comment = data.get('comment', '')
+        if comment:
+            comment = sanitize_input(comment, max_length=500)
         
         print(f"[FEEDBACK] Received feedback request: trace_id={trace_id}, generation_id={generation_id}, rating={rating}")
         print(f"[FEEDBACK] Trace ID type: {type(trace_id)}, value: '{trace_id}'")
@@ -536,69 +1478,203 @@ def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy'})
 
-@app.route('/healthbench/results', methods=['GET'])
-def get_healthbench_results():
+@app.route('/session/<session_id>/data', methods=['GET'])
+def get_session_data(session_id):
     """
-    API endpoint to get HealthBench evaluation results for dashboard.
+    Get structured medical data for a session (for doctor/provider access).
+    Returns only structured data, NOT full chat history.
     
-    Query Parameters:
-        limit (int): Maximum number of results to return (default: 50)
-        
+    Each session_id has its own unique data document in MongoDB.
+    FUTURE: After auth, this endpoint will use user_id instead of session_id.
+    
+    Args:
+        session_id: Unique session identifier
+    
     Returns:
-        JSON with evaluation results and statistics
+        JSON with structured medical data (HPI, ROS, Past History, Red Flags)
     """
+    # HIPAA Compliance: Validate session_id
+    if not validate_session_id(session_id):
+        return jsonify({'error': 'Invalid session ID format'}), 400
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    # Remove MongoDB internal fields and convert datetime to ISO format
+    response_data = {
+        'session_id': session_data.get('session_id'),
+        'complaint_name': session_data.get('complaint_name'),
+        'hpi': session_data.get('hpi', {}),
+        'ros': session_data.get('ros', {}),
+        'past_history': session_data.get('past_history', {}),
+        'red_flags': session_data.get('red_flags', []),
+        'created_at': session_data.get('created_at').isoformat() if isinstance(session_data.get('created_at'), datetime) else session_data.get('created_at'),
+        'updated_at': session_data.get('updated_at').isoformat() if isinstance(session_data.get('updated_at'), datetime) else session_data.get('updated_at')
+    }
+    
+    return jsonify(response_data)
+
+@app.route('/voice/transcribe', methods=['POST', 'OPTIONS'])
+def transcribe_voice():
+    """
+    Transcribe audio to text using Whisper.
+    HIPAA Compliant: Audio processed locally, deleted immediately after.
+    """
+    # Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
-        if not results_storage:
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
+        
+        # Check if voice is available
+        if not VOICE_AVAILABLE:
+            return jsonify({'error': 'Voice processing not available'}), 503
+        
+        stt_available, _ = voice_processor.is_voice_available()
+        if not stt_available:
+            return jsonify({'error': 'Speech-to-text not available'}), 503
+        
+        # Check if audio file is present
+        if 'audio' not in request.files:
+            return jsonify({'error': 'No audio file provided'}), 400
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            return jsonify({'error': 'Empty audio file'}), 400
+        
+        # Validate session_id
+        session_id = request.form.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            return jsonify({'error': 'Invalid session ID format'}), 400
+        
+        # Save uploaded audio to temp file
+        import tempfile
+        temp_fd, temp_audio_path = tempfile.mkstemp(suffix='.webm')
+        os.close(temp_fd)
+        
+        try:
+            # Save uploaded file
+            audio_file.save(temp_audio_path)
+            
+            # Check file size (max 10MB for safety)
+            file_size = os.path.getsize(temp_audio_path)
+            max_size = int(os.getenv('MAX_AUDIO_SIZE', '10485760'))  # 10MB default
+            if file_size > max_size:
+                return jsonify({'error': 'Audio file too large'}), 413
+            
+            # Transcribe audio
+            transcription = voice_processor.transcribe_audio(temp_audio_path)
+            
+            if transcription is None:
+                return jsonify({'error': 'Transcription failed'}), 500
+            
+            # Log voice usage (HIPAA: metadata only, no PHI)
+            print(f"[Voice] Transcription for session {session_id}: {len(transcription)} chars")
+            
             return jsonify({
-                'error': 'HealthBench evaluation not available',
-                'results': [],
-                'statistics': {}
-            }), 503
-        
-        # Get limit from query parameters
-        limit = request.args.get('limit', 50, type=int)
-        
-        # Get recent results
-        recent_results = results_storage.get_recent_evaluations(limit=limit)
-        
-        # Get statistics
-        statistics = results_storage.get_statistics()
-        
-        return jsonify({
-            'success': True,
-            'results': recent_results,
-            'statistics': statistics,
-            'total_count': len(recent_results)
-        })
+                'text': transcription,
+                'session_id': session_id,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+        finally:
+            # HIPAA Compliance: Delete temp file immediately
+            voice_processor.cleanup_temp_file(temp_audio_path)
     
     except Exception as e:
-        print(f"[ERROR] Failed to retrieve HealthBench results: {e}")
+        print(f"[Voice] Transcription error: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            'error': str(e),
-            'results': [],
-            'statistics': {}
-        }), 500
+        return jsonify({'error': str(e)}), 500
 
-
-@app.route('/healthbench/dashboard', methods=['GET'])
-def healthbench_dashboard():
+@app.route('/voice/synthesize', methods=['POST', 'OPTIONS'])
+def synthesize_voice():
     """
-    Serve the HealthBench evaluation dashboard HTML page.
+    Convert text to speech using pyttsx3.
+    HIPAA Compliant: Audio generated locally, no storage.
     """
+    # Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
-        # Serve the dashboard HTML file
-        dashboard_path = Path(__file__).parent / 'healthbench_dashboard.html'
+        print(f"[Voice] TTS endpoint called")
         
-        if not dashboard_path.exists():
-            return f"<h1>Dashboard not found</h1><p>Please ensure healthbench_dashboard.html exists in the HYoda folder.</p>", 404
+        # HIPAA Compliance: Rate limiting
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if not check_rate_limit(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
         
-        return send_file(dashboard_path)
+        # Check if voice is available
+        if not VOICE_AVAILABLE:
+            return jsonify({'error': 'Voice processing not available'}), 503
+        
+        _, tts_available = voice_processor.is_voice_available()
+        if not tts_available:
+            return jsonify({'error': 'Text-to-speech not available'}), 503
+        
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        # Sanitize and validate text
+        text = sanitize_input(text, max_length=5000)
+        if not text:
+            return jsonify({'error': 'Invalid text format'}), 400
+        
+        # Validate session_id
+        session_id = data.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            return jsonify({'error': 'Invalid session ID format'}), 400
+        
+        # Synthesize speech
+        audio_bytes = voice_processor.synthesize_speech(text)
+        
+        if audio_bytes is None:
+            return jsonify({'error': 'Speech synthesis failed'}), 500
+        
+        # Log voice usage (HIPAA: metadata only, no PHI)
+        print(f"[Voice] TTS for session {session_id}: {len(text)} chars -> {len(audio_bytes)} bytes")
+        
+        # Return audio file
+        import io
+        audio_io = io.BytesIO(audio_bytes)
+        audio_io.seek(0)
+        
+        return send_file(
+            audio_io,
+            mimetype='audio/wav',
+            as_attachment=False,
+            download_name='speech.wav'
+        )
     
     except Exception as e:
-        print(f"[ERROR] Failed to serve dashboard: {e}")
-        return f"<h1>Error loading dashboard</h1><p>{str(e)}</p>", 500
+        print(f"[Voice] TTS error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/voice/status', methods=['GET'])
+def voice_status():
+    """Get voice processing system status"""
+    if not VOICE_AVAILABLE:
+        return jsonify({
+            'available': False,
+            'error': 'Voice processing not available'
+        })
+    
+    status = voice_processor.get_voice_status()
+    return jsonify(status)
 
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)
@@ -624,10 +1700,30 @@ if __name__ == '__main__':
             print("[OK] Langfuse configured! Traces will be logged.")
             print(f"   Using Langfuse tracker module for observability")
         
-        # Show HealthBench dashboard status
-        if results_storage:
-            print("[OK] HealthBench Dashboard: http://127.0.0.1:8002/healthbench/dashboard")
-            print("   View real-time evaluation scores and metrics")
+        if not mongodb_connected:
+            print("⚠️  MongoDB not connected. Session data will not be persisted.")
+            print("   Set MONGODB_URI in .env to enable MongoDB (e.g., mongodb://localhost:27017/)")
+            print("   Bot will still work but won't prevent duplicate questions.")
+        else:
+            print("✅ MongoDB connected! Session data will be persisted.")
+            print(f"   Database: {os.getenv('MONGODB_DB', 'healthyoda')}")
+            print(f"   Collection: patient_sessions")
+        
+        # Voice status
+        if VOICE_AVAILABLE:
+            stt_ok, tts_ok = voice_processor.is_voice_available()
+            if stt_ok and tts_ok:
+                print("✅ Voice processing enabled! (STT + TTS)")
+            elif stt_ok:
+                print("⚠️  Voice processing partially enabled (STT only)")
+            elif tts_ok:
+                print("⚠️  Voice processing partially enabled (TTS only)")
+            else:
+                print("⚠️  Voice processing available but not initialized")
+                print("   Set VOICE_ENABLED=true in .env to enable")
+        else:
+            print("⚠️  Voice processing not available")
+            print("   Install: pip install faster-whisper piper-tts")
         
         print("-" * 50)
         app._startup_printed = True

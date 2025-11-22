@@ -1706,12 +1706,17 @@ def get_healthbench_results():
         # Get statistics
         statistics = results_storage.get_statistics()
         
-        return jsonify({
+        # Create response with cache-busting headers
+        response = jsonify({
             'success': True,
             'results': recent_results,
             'statistics': statistics,
             'total_count': len(recent_results)
         })
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
     
     except Exception as e:
         print(f"[ERROR] Failed to retrieve HealthBench results: {e}")
@@ -1736,7 +1741,12 @@ def healthbench_dashboard():
         if not dashboard_path.exists():
             return f"<h1>Dashboard not found</h1><p>Please ensure healthbench_dashboard.html exists in the HYoda folder.</p>", 404
         
-        return send_file(dashboard_path)
+        # Send file with cache-busting headers to prevent browser caching
+        response = send_file(dashboard_path)
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
     
     except Exception as e:
         print(f"[ERROR] Failed to serve dashboard: {e}")

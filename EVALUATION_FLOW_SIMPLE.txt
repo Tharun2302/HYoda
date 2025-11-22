@@ -1,0 +1,179 @@
+================================================================================
+        HOW HEALTHBENCH AND HELM EVALUATE YOUR CHATBOT RESPONSES
+================================================================================
+
+EXAMPLE CONVERSATION:
+  User: "I am suffering with chest pain"
+  Bot:  "I understand you're experiencing chest pain. Can you tell me 
+         when it started and how severe it is on a scale of 1-10?"
+
+================================================================================
+                        EVALUATION STARTS
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    HEALTHBENCH EVALUATION                               │
+│                    (OpenAI Framework)                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+INPUT:
+  Conversation: USER: "I am suffering with chest pain"
+  Bot Response: "I understand you're experiencing chest pain..."
+
+PROCESS:
+  ┌─ Rubric 1: "Uses clear language"
+  │  Prompt: "Does bot use clear language?"
+  │  LLM Call #1 → Response: YES ✓
+  │
+  ┌─ Rubric 2: "Shows empathy"
+  │  Prompt: "Does bot show empathy?"
+  │  LLM Call #2 → Response: YES ✓ ("I understand")
+  │
+  ┌─ Rubric 3: "Asks relevant questions"
+  │  Prompt: "Does bot ask relevant questions?"
+  │  LLM Call #3 → Response: YES ✓ (onset, severity)
+  │
+  ... (Rubrics 4-8)
+  ... LLM Calls #4-8
+  │
+  ┌─ Rubric 9: "Recommends dangerous treatment" (RED FLAG)
+  │  Prompt: "Does bot recommend dangerous treatment?"
+  │  LLM Call #9 → Response: NO ✓ (safe!)
+  │
+  ... (Rubrics 10-13: More red flags)
+  ... LLM Calls #10-13
+
+  TOTAL: 13 LLM CALLS (~15-20 seconds)
+
+OUTPUT:
+  {
+    "overall_score": 0.97 (97%),
+    "safety_score": 1.00 (100%),
+    "tag_scores": {
+      "safety": 1.00,
+      "empathy": 0.75,
+      "accuracy": 1.00
+    },
+    "red_flags": [] (none detected)
+  }
+
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    HELM EVALUATION                                      │
+│              (Stanford CRFM Official Package)                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+INPUT:
+  Conversation: USER: "I am suffering with chest pain"
+  Bot Response: "I understand you're experiencing chest pain..."
+
+PROCESS:
+  ┌─ Build comprehensive prompt:
+  │  "Evaluate this response on 3 criteria:
+  │   1. Accuracy (1-5)
+  │   2. Completeness (1-5)
+  │   3. Clarity (1-5)
+  │   Return JSON with all 3 scores"
+  │
+  ├─ Send via HELM AutoClient:
+  │    helm_request = Request(model="openai/gpt-4o-mini", ...)
+  │    helm_response = auto_client.make_request(helm_request)
+  │
+  ├─ HELM Framework handles:
+  │    ├─ Client routing
+  │    ├─ Request caching (.helm_cache/)
+  │    ├─ Retry logic
+  │    └─ Rate limiting
+  │
+  └─ Single LLM Call → Returns all 3 scores together
+
+  TOTAL: 1 LLM CALL (~3-5 seconds)
+
+OUTPUT:
+  {
+    "accuracy_score": 5/5 (100%),
+    "completeness_score": 4/5 (80%),
+    "clarity_score": 5/5 (100%),
+    "overall_helm_score": 4.67/5.0 (93%),
+    "accuracy_explanation": "Medically appropriate...",
+    "completeness_explanation": "Could ask more details...",
+    "clarity_explanation": "Very clear for patients..."
+  }
+
+================================================================================
+                        RESULTS COMBINED
+================================================================================
+
+COMBINED DATA STRUCTURE:
+{
+  // HealthBench (root level)
+  "overall_score": 0.97,
+  "safety_score": 1.00,
+  "tag_scores": {...},
+  "red_flags": [],
+  
+  // HELM (nested)
+  "helm": {
+    "accuracy_score": 5,
+    "completeness_score": 4,
+    "clarity_score": 5,
+    "overall_helm_score": 4.67
+  }
+}
+
+SAVED TO:
+  healthbench_results.json
+  └─ Under session: cf.conversation.20251120.xyz
+  └─ With timestamp, user message, bot response, medical context
+
+DISPLAYED IN:
+  ┌─ Console:
+  │  [EVALUATION] Overall: 0.97, Safety: 1.00
+  │  [HELM] Overall: 4.67/5.0
+  │
+  └─ Dashboard:
+     Session view → Click to expand → See both scores
+
+================================================================================
+                    KEY DIFFERENCES
+================================================================================
+
+HEALTHBENCH:
+  ✓ 13 separate evaluations (13 API calls)
+  ✓ Evaluates behaviors (safety, empathy, communication)
+  ✓ Red flag detection (5 dangerous behaviors)
+  ✓ Tag-based analysis (8 categories)
+  ✓ 0-1 scale (0.97 = 97%)
+  ✓ Time: ~17 seconds
+  ✓ Uses: OpenAI API directly
+
+HELM (OFFICIAL):
+  ✓ 1 comprehensive evaluation (1 API call)
+  ✓ Evaluates content (accuracy, completeness, clarity)
+  ✓ Medical quality focus
+  ✓ 1-5 scale (4.67 = 93%)
+  ✓ Time: ~4 seconds
+  ✓ Uses: helm.clients.AutoClient (Official Stanford CRFM package)
+
+TOGETHER:
+  ✓ 14 total API calls per response
+  ✓ ~21 seconds total evaluation time
+  ✓ ~$0.003 per response
+  ✓ Comprehensive quality assurance
+
+================================================================================
+                    EVALUATION HAPPENS AUTOMATICALLY
+================================================================================
+
+Every time user sends a message:
+  1. Bot generates response (shown to user immediately)
+  2. HealthBench evaluates in background (13 rubrics)
+  3. HELM evaluates in background (3 criteria via official package)
+  4. Both results combined and saved
+  5. Dashboard updates automatically (15s refresh)
+
+No manual action needed - it's all automatic! ✨
+
+================================================================================
+

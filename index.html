@@ -851,16 +851,16 @@
     const sendBtn = document.getElementById("send-btn");
 
     
-    // Generate a session ID for conversation memory and Langfuse tracking
-    let sessionId = localStorage.getItem('chatbot_session_id');
-    if (!sessionId) {
-      // Create readable session format: cf.conversation.YYYYMMDD.randomId
-      const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-      const randomId = Math.random().toString(36).substr(2, 9);
-      sessionId = `cf.conversation.${date}.${randomId}`;
-      localStorage.setItem('chatbot_session_id', sessionId);
-      // Session created
-    }
+    // Generate a FRESH session ID for each page load (new conversation)
+    // This ensures each time user opens chatbot, it's a NEW session
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const timestamp = new Date().getTime().toString().slice(-6); // Last 6 digits of timestamp
+    const randomId = Math.random().toString(36).substr(2, 6);
+    let sessionId = `cf.conversation.${date}.${timestamp}${randomId}`;
+    
+    // Store the new session
+    localStorage.setItem('chatbot_session_id', sessionId);
+    console.log('[NEW SESSION] Created:', sessionId);
 
     // Helper function to remove edit button from previous user messages
     function removeAllEditButtons() {
@@ -1563,9 +1563,11 @@
       
       // Create new session for new conversation
       const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-      const randomId = Math.random().toString(36).substr(2, 9);
-      sessionId = `cf.conversation.${date}.${randomId}`;
+      const timestamp = new Date().getTime().toString().slice(-6);
+      const randomId = Math.random().toString(36).substr(2, 6);
+      sessionId = `cf.conversation.${date}.${timestamp}${randomId}`;
       localStorage.setItem('chatbot_session_id', sessionId);
+      console.log('[NEW CHAT] New session created:', sessionId);
       messagesDiv.innerHTML = '';
       // Messages cleared
     }
@@ -1715,10 +1717,11 @@
     async function permanentlyDeleteChat() {
       // Create new session for new conversation
       const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-      const randomId = Math.random().toString(36).substr(2, 9);
-      sessionId = `cf.conversation.${date}.${randomId}`;
+      const timestamp = new Date().getTime().toString().slice(-6);
+      const randomId = Math.random().toString(36).substr(2, 6);
+      sessionId = `cf.conversation.${date}.${timestamp}${randomId}`;
       localStorage.setItem('chatbot_session_id', sessionId);
-      // New session created
+      console.log('[DELETE CHAT] New session created:', sessionId);
       
       // Clear backup
       chatBackup = null;
@@ -1817,9 +1820,11 @@
       
       // Create new session
       const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-      const randomId = Math.random().toString(36).substr(2, 9);
-      sessionId = `cf.conversation.${date}.${randomId}`;
+      const timestamp = new Date().getTime().toString().slice(-6);
+      const randomId = Math.random().toString(36).substr(2, 6);
+      sessionId = `cf.conversation.${date}.${timestamp}${randomId}`;
       localStorage.setItem('chatbot_session_id', sessionId);
+      console.log('[LOGOUT] New session created:', sessionId);
       
       // Session cleared
     }

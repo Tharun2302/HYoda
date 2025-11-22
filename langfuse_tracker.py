@@ -29,13 +29,19 @@ load_dotenv()
 # CONFIGURATION - Load from environment variables
 # ============================================================================
 
+# Check if Langfuse is explicitly disabled
+LANGFUSE_ENABLED = os.getenv("LANGFUSE_ENABLED", "true").lower() == "true"
+
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
 # Initialize Langfuse client
 try:
-    if not LANGFUSE_SECRET_KEY or not LANGFUSE_PUBLIC_KEY:
+    if not LANGFUSE_ENABLED:
+        print("[!] Langfuse explicitly disabled (LANGFUSE_ENABLED=false)")
+        langfuse_client = None
+    elif not LANGFUSE_SECRET_KEY or not LANGFUSE_PUBLIC_KEY:
         print("[!] Langfuse credentials not found - observability disabled")
         langfuse_client = None
     else:

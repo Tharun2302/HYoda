@@ -12,7 +12,7 @@ try:
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    print("⚠️  ChromaDB not installed - vector database features disabled")
+    print("[WARNING] ChromaDB not installed - vector database features disabled")
 
 class QuestionBookRAG:
     """RAG system for retrieving relevant questions from the Question Book"""
@@ -38,7 +38,7 @@ class QuestionBookRAG:
                     metadata={"description": "HealthYoda Question Book embeddings"}
                 )
             except Exception as e:
-                print(f"⚠️  ChromaDB initialization failed: {e}")
+                print(f"[WARNING] ChromaDB initialization failed: {e}")
                 import traceback
                 traceback.print_exc()
                 self.chroma_client = None
@@ -198,21 +198,21 @@ class QuestionBookRAG:
             force_rebuild: If True, rebuild embeddings even if they exist
         """
         if not self.collection:
-            print("⚠️  Vector database not available - skipping embeddings. Using keyword search only.")
+            print("[WARNING] Vector database not available - skipping embeddings. Using keyword search only.")
             return
             
         if not self.openai_client:
-            print("⚠️  OpenAI client not available - skipping embeddings. Using keyword search only.")
+            print("[WARNING] OpenAI client not available - skipping embeddings. Using keyword search only.")
             return
         
         # Check if collection already has data (unless force rebuild)
         if not force_rebuild and self.collection.count() > 0:
-            print(f"✅ Vector database already has {self.collection.count()} embeddings")
+            print(f"[OK] Vector database already has {self.collection.count()} embeddings")
             print(f"   Set REBUILD_VECTORSTORE=true in .env to rebuild")
             return
         
         if force_rebuild and self.collection.count() > 0:
-            print(f"🔄 Rebuilding vector database (current: {self.collection.count()} embeddings)...")
+            print(f"[INFO] Rebuilding vector database (current: {self.collection.count()} embeddings)...")
             # Delete existing collection and recreate
             self.chroma_client.delete_collection(name="question_book")
             self.collection = self.chroma_client.create_collection(
@@ -282,7 +282,7 @@ class QuestionBookRAG:
                 print(f"  Error creating embeddings for batch {i}: {e}")
                 continue
         
-        print(f"✅ Created {self.collection.count()} embeddings in vector database")
+        print(f"[OK] Created {self.collection.count()} embeddings in vector database")
     
     def search_by_system(self, system_name: str) -> List[Dict]:
         """Retrieve all questions for a specific system"""

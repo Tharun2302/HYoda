@@ -45,11 +45,8 @@ class LangfuseScorer:
             return
         
         try:
-            # Get the trace object
-            trace = self.langfuse.get_trace(trace_id)
-            if not trace:
-                print(f"[LANGFUSE SCORER] Could not find trace {trace_id}")
-                return
+            # Note: We don't need to fetch the trace object first.
+            # Langfuse allows logging scores directly with just the trace_id
             
             # Log overall score (using client.score for compatibility)
             self.langfuse.score(

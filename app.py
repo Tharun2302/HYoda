@@ -68,7 +68,19 @@ def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    
+    # Apply relaxed CSP for HTML pages (allow inline styles/scripts for UI)
+    # Strict CSP for API routes is not needed since they return JSON
+    if 'Content-Security-Policy' not in response.headers:
+        # Only set CSP if not already set by individual routes
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type:
+            # For HTML pages, allow inline styles and scripts (needed for dashboard and chatbot UI)
+            response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
+        else:
+            # For other content (JSON, etc.), use strict CSP
+            response.headers['Content-Security-Policy'] = "default-src 'self'"
+    
     return response
 
 # Initialize OpenAI client
@@ -1735,17 +1747,28 @@ def healthbench_dashboard():
     Serve the HealthBench evaluation dashboard HTML page.
     """
     try:
-        # Serve the dashboard HTML file
-        dashboard_path = Path(__file__).parent / 'healthbench_dashboard.html'
+        # Serve the V3 dashboard with all scores displayed prominently
+        dashboard_path = Path(__file__).parent / 'healthbench_dashboard_v3.html'
         
         if not dashboard_path.exists():
-            return f"<h1>Dashboard not found</h1><p>Please ensure healthbench_dashboard.html exists in the HYoda folder.</p>", 404
+            dashboard_path = Path(__file__).parent / 'healthbench_dashboard_clean.html'
+        
+        if not dashboard_path.exists():
+            dashboard_path = Path(__file__).parent / 'healthbench_dashboard.html'
+        
+        if not dashboard_path.exists():
+            return f"<h1>Dashboard not found</h1><p>Please ensure dashboard file exists in the HYoda folder.</p>", 404
         
         # Send file with cache-busting headers to prevent browser caching
         response = send_file(dashboard_path)
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
+        
+        # Override CSP for dashboard to allow inline styles and scripts
+        # Dashboard is internal tool, not patient-facing, so this is acceptable
+        response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
+        
         return response
     
     except Exception as e:
@@ -1759,7 +1782,7 @@ def index():
     """
     Landing page with links to chatbot and dashboard.
     """
-    return """
+    html_content = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -1864,6 +1887,40 @@ def index():
     </body>
     </html>
     """
+    
+    # Create response with modified CSP headers to allow inline styles
+    from flask import make_response
+    response = make_response(html_content)
+    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    return response
+
+@app.route('/index.html', methods=['GET'])
+def chatbot_interface():
+    """
+    Serve the main chatbot interface HTML page.
+    """
+    try:
+        chatbot_path = Path(__file__).parent / 'index.html'
+        
+        if not chatbot_path.exists():
+            return f"<h1>Chatbot Interface not found</h1><p>Please ensure index.html exists in the HYoda folder.</p>", 404
+        
+        # Send file with cache-busting and relaxed CSP headers
+        response = send_file(chatbot_path)
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        
+        # Allow inline styles and scripts for chatbot UI
+        response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002; img-src 'self' data: blob:; media-src 'self' blob:"
+        
+        return response
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to serve chatbot interface: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"<h1>Error</h1><p>{str(e)}</p>", 500
 
 if __name__ == '__main__':
     # Only print startup messages once (not on reload)

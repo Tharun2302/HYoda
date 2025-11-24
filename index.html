@@ -994,6 +994,9 @@
     // Store the new session
     localStorage.setItem('chatbot_session_id', sessionId);
     console.log('[NEW SESSION] Created:', sessionId);
+    
+    // Flag to prevent duplicate greetings
+    let greetingSent = false;
 
     // Helper function to remove edit button from previous user messages
     function removeAllEditButtons() {
@@ -1688,6 +1691,9 @@
       addMessage(question, "user");
       input.value = "";
       
+      // Mark greeting as sent since user has started conversation
+      greetingSent = true;
+      
       // Send the message
       await sendMessageText(question);
     }
@@ -2056,6 +2062,168 @@
       console.log('[NEW CHAT] New session created:', sessionId);
       messagesDiv.innerHTML = '';
       // Messages cleared
+      
+      // Reset greeting flag for new conversation
+      greetingSent = false;
+      
+      // Send initial greeting from bot
+      sendInitialGreeting();
+    }
+    
+    // Function to send initial greeting message from bot
+    // This gets the initial greeting directly from the backend following the system prompt
+    async function sendInitialGreeting() {
+      // Prevent duplicate greetings
+      if (greetingSent) {
+        console.log('[GREETING] Greeting already sent, skipping');
+        return;
+      }
+      
+      // Check if there are already messages (including bot messages)
+      if (messagesDiv.children.length > 0) {
+        console.log('[GREETING] Messages already exist, skipping');
+        greetingSent = true;
+        return;
+      }
+      
+      // Check if there are any user messages (conversation has started)
+      const userMessages = messagesDiv.querySelectorAll('.message.user');
+      if (userMessages.length > 0) {
+        console.log('[GREETING] User has already sent messages, skipping');
+        greetingSent = true;
+        return;
+      }
+      
+      greetingSent = true;
+      
+      // Show thinking animation
+      const botDiv = addMessageHTML("", "bot");
+      botDiv.innerHTML = `
+        <div class="thinking">
+          Thinking
+          <span class="thinking-dots">
+            <span></span>
+            <span></span>
+            <span></span>
+          </span>
+        </div>
+      `;
+      
+      // Force scroll to ensure thinking is visible
+      setTimeout(() => scrollToBottom(), 50);
+      
+      // Start streaming - enable scroll tracking
+      isStreaming = true;
+      scrollMode = 'auto';
+      updateButtonVisibility();
+      
+      try {
+        const response = await fetch(`${getApiBase()}/chat/greeting`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            session_id: sessionId
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        // Keep thinking animation until we get thinking_complete signal
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let fullResponse = "";
+        let lastRenderTime = 0;
+        const renderThrottle = 16; // 60fps - re-render every 16ms for smooth streaming
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ""; // Keep incomplete line in buffer
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                
+                if (data.type === 'thinking_complete') {
+                  // Clear thinking animation and prepare for streaming
+                  botDiv.innerHTML = `<div class="message-content"></div>`;
+                } else if (data.type === 'token') {
+                  // Add token to response
+                  const token = data.token;
+                  fullResponse += token;
+                  
+                  // Throttle rendering to improve performance
+                  const now = Date.now();
+                  if (now - lastRenderTime > renderThrottle) {
+                    // Render markdown and update only the message content
+                    const contentDiv = botDiv.querySelector('.message-content');
+                    if (contentDiv) {
+                      contentDiv.innerHTML = renderMarkdown(fullResponse);
+                    } else {
+                      // Fallback: create content div only
+                      botDiv.innerHTML = `<div class="message-content">${renderMarkdown(fullResponse)}</div>`;
+                    }
+                    scrollToBottom();
+                    lastRenderTime = now;
+                  }
+                } else if (data.type === 'done') {
+                  // Final response received
+                  fullResponse = data.full_response || fullResponse;
+                  
+                  // Check if response is empty
+                  if (!fullResponse || fullResponse.trim() === '') {
+                    console.error("⚠️ Empty greeting received!");
+                    fullResponse = "Hello! I'm HealthYoda, your medical intake assistant. What brings you in today?";
+                  }
+                  
+                  // Final render with complete response and buttons
+                  botDiv.innerHTML = `
+                    <div class="message-content">${renderMarkdown(fullResponse)}</div>
+                    <div class="feedback-buttons">
+                      <button class="copy-button" onclick="copyMessage(this)" title="Copy message">
+                        📋
+                      </button>
+                      <button class="feedback-btn thumbs-up" onclick="submitFeedback(this, 'thumbs_up')" title="Good response">
+                        👍
+                      </button>
+                      <button class="feedback-btn thumbs-down" onclick="submitFeedback(this, 'thumbs_down')" title="Bad response">
+                        👎
+                      </button>
+                      <span class="feedback-text"></span>
+                    </div>
+                  `;
+                  
+                  scrollToBottom();
+                  isStreaming = false;
+                } else if (data.type === 'error') {
+                  throw new Error(data.error || 'Unknown error');
+                }
+              } catch (parseError) {
+                console.error('[GREETING] Error parsing stream data:', parseError);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[GREETING] Error getting greeting:', error);
+        // Remove thinking animation and reset flag
+        if (botDiv && botDiv.parentNode) {
+          botDiv.remove();
+        }
+        greetingSent = false;
+        isStreaming = false;
+        // Fallback: send a message to trigger the bot
+        await sendMessageText("start");
+      }
     }
 
     // Variables for undo functionality
@@ -2089,7 +2257,8 @@
         // Initialize countdown circle
         initializeCountdownCircle();
         
-        // Start countdown
+        // Start countdown - this will call permanentlyDeleteChat after 3 seconds
+        // The greeting will be sent AFTER the timer ends (in permanentlyDeleteChat)
         startUndoCountdown();
       } else {
         // Restore chat
@@ -2188,6 +2357,9 @@
         sessionId = chatBackup.sessionId;
         localStorage.setItem('chatbot_session_id', sessionId);
         
+        // Reset greeting flag since we're restoring old chat
+        greetingSent = true; // Set to true since we have messages
+        
         // Scroll to bottom after restoring messages
         scrollToBottom();
         
@@ -2207,13 +2379,21 @@
       const randomId = Math.random().toString(36).substr(2, 6);
       sessionId = `cf.conversation.${date}.${timestamp}${randomId}`;
       localStorage.setItem('chatbot_session_id', sessionId);
-      console.log('[DELETE CHAT] New session created:', sessionId);
+      
+      // Clear messages display
+      messagesDiv.innerHTML = '';
       
       // Clear backup
       chatBackup = null;
       
       // Reset button
       resetNewChatButton();
+      
+      // Reset greeting flag for new conversation
+      greetingSent = false;
+      
+      // Now start the new conversation with greeting (after undo timer ended)
+      await startNewConversation();
     }
 
     // Reset new chat button to normal state
@@ -2451,12 +2631,30 @@
           if (user.id) {
             loadUserChatHistory(user.id).catch(error => {
               console.error('[ERROR] Failed to load history, but continuing:', error);
+              // If history loading fails and no messages, send greeting
+              setTimeout(() => {
+                if (messagesDiv.children.length === 0 && !greetingSent) {
+                  sendInitialGreeting();
+                }
+              }, 500);
             }).finally(() => {
               hideLoadingIndicator();
+              // Double-check after history load completes - if still no messages, send greeting
+              setTimeout(() => {
+                if (messagesDiv.children.length === 0 && !greetingSent) {
+                  sendInitialGreeting();
+                }
+              }, 300);
             });
           } else {
             console.warn('[WARNING] User ID is undefined, skipping history load');
             hideLoadingIndicator();
+            // No user ID, send greeting
+            setTimeout(() => {
+              if (messagesDiv.children.length === 0 && !greetingSent) {
+                sendInitialGreeting();
+              }
+            }, 500);
           }
         } else {
           // Handle different failure reasons
@@ -2547,6 +2745,9 @@
       try {
         // Loading chat history
         
+        // Reset greeting flag when loading history (will be set if history is empty)
+        greetingSent = false;
+        
         // Check if userId is valid
         if (!userId || userId === 'undefined' || userId === 'null') {
           console.error('[HISTORY] Invalid user ID:', userId);
@@ -2568,7 +2769,7 @@
           }
         });
         
-        if (response.ok) {
+          if (response.ok) {
           const data = await response.json();
           const history = data.history || [];
           // History loaded
@@ -2595,7 +2796,10 @@
             // Scroll to bottom
             scrollToBottom();
           } else {
-            // No history to load
+            // No history to load - send initial greeting
+            if (!greetingSent) {
+              sendInitialGreeting();
+            }
           }
         } else {
           console.error('[HISTORY] Failed to load, status:', response.status);
@@ -2606,6 +2810,10 @@
         console.error('[HISTORY] Failed to load chat history:', error);
         console.error('[HISTORY] Error details:', error.message, error.stack);
         // Continue with empty chat if loading fails
+        // Send greeting if no messages are displayed
+        if (messagesDiv.children.length === 0 && !greetingSent) {
+          sendInitialGreeting();
+        }
       }
     }
 
@@ -2637,6 +2845,17 @@
     document.getElementById('userMenu').addEventListener('click', toggleDropdown);
     document.getElementById('logoutBtn').addEventListener('click', handleLogout);
     document.addEventListener('click', closeDropdown);
+    
+    // Check if we need to send initial greeting on page load
+    // Wait a bit to allow history to load first
+    setTimeout(() => {
+      // Only send greeting if no messages are displayed and greeting hasn't been sent
+      if (messagesDiv.children.length === 0 && !greetingSent) {
+        // Send greeting regardless of session - if there's a session but no messages,
+        // it means it's a new conversation and needs greeting
+        sendInitialGreeting();
+      }
+    }, 1500); // Wait 1.5 seconds for history to potentially load
   </script>
 </body>
 </html>

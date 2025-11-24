@@ -57,7 +57,8 @@ app = Flask(__name__)
 
 # HIPAA Compliance: Restrict CORS to specific origins only
 # In production, replace with actual frontend domain(s)
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000').split(',')
+# Allow both port 8000 (separate frontend server) and 8002 (Flask serving frontend)
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000,http://localhost:8002,http://127.0.0.1:8002').split(',')
 CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
 # HIPAA Compliance: Add security headers
@@ -76,10 +77,13 @@ def add_security_headers(response):
         content_type = response.headers.get('Content-Type', '')
         if 'text/html' in content_type:
             # For HTML pages, allow inline styles and scripts (needed for dashboard and chatbot UI)
-            response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
+            # Allow marked.js CDN and connections to both localhost and 127.0.0.1 on port 8002
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
         else:
             # For other content (JSON, etc.), use strict CSP
             response.headers['Content-Security-Policy'] = "default-src 'self'"
+    
+    return response
     
     return response
 
@@ -539,6 +543,124 @@ def store_qa_pair(session_id, question, answer):
     update_session_data(session_id, {'qa_pairs': qa_pairs})
     print(f"[MongoDB] Stored Q&A: Q='{question[:50]}...' A='{answer[:50]}...'")
 
+def extract_complaint_name(session_id, user_response, bot_question):
+    """
+    Intelligently extract the complaint name from user's first response.
+    Uses LLM to identify the actual complaint vs timing/onset information.
+    """
+    if not client:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data or session_data.get('complaint_name'):
+        return  # Already has complaint name
+    
+    extraction_prompt = f"""Extract the MAIN COMPLAINT or CHIEF COMPLAINT from the patient's response.
+
+Bot Question: "{bot_question}"
+Patient Response: "{user_response}"
+
+Identify the PRIMARY MEDICAL COMPLAINT (e.g., "chest pain", "headache", "stomach ache", "shortness of breath").
+DO NOT extract timing information (yesterday, today, etc.) as the complaint.
+DO NOT extract location-only information unless it's part of the complaint.
+
+If the response contains a complaint, return JSON: {{"complaint_name": "the actual complaint"}}
+If the response is only timing/onset information, return: {{"complaint_name": null}}
+If unclear, return: {{"complaint_name": null}}
+
+Examples:
+- Q: "What brings you in?" A: "chest pain" → {{"complaint_name": "chest pain"}}
+- Q: "What brings you in?" A: "pain in my stomach" → {{"complaint_name": "pain in stomach"}}
+- Q: "What brings you in?" A: "yesterday" → {{"complaint_name": null}}
+- Q: "When did it start?" A: "yesterday" → {{"complaint_name": null}}
+- Q: "What brings you in?" A: "I have a headache since yesterday" → {{"complaint_name": "headache"}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{'role': 'user', 'content': extraction_prompt}],
+            temperature=0.1,
+            max_tokens=200
+        )
+        
+        extracted_text = response.choices[0].message.content.strip()
+        # Parse JSON
+        import json
+        # Remove markdown code blocks if present
+        if '```json' in extracted_text:
+            extracted_text = extracted_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in extracted_text:
+            extracted_text = extracted_text.split('```')[1].split('```')[0].strip()
+        
+        extracted_data = json.loads(extracted_text)
+        
+        complaint_name = extracted_data.get('complaint_name')
+        if complaint_name and complaint_name.lower() != 'null':
+            update_session_data(session_id, {'complaint_name': complaint_name[:100]})
+            print(f"[LLM Extract] Set complaint_name: {complaint_name}")
+    except Exception as e:
+        print(f"[LLM Extract] Error extracting complaint name: {e}")
+
+def extract_complaint_name(session_id, user_response, bot_question):
+    """
+    Intelligently extract the complaint name from user's first response.
+    Uses LLM to identify the actual complaint vs timing/onset information.
+    """
+    if not client:
+        return
+    
+    session_data = get_or_create_session_data(session_id)
+    if not session_data or session_data.get('complaint_name'):
+        return  # Already has complaint name
+    
+    extraction_prompt = f"""Extract the MAIN COMPLAINT or CHIEF COMPLAINT from the patient's response.
+
+Bot Question: "{bot_question}"
+Patient Response: "{user_response}"
+
+Identify the PRIMARY MEDICAL COMPLAINT (e.g., "chest pain", "headache", "stomach ache", "shortness of breath").
+DO NOT extract timing information (yesterday, today, etc.) as the complaint.
+DO NOT extract location-only information unless it's part of the complaint.
+
+If the response contains a complaint, return JSON: {{"complaint_name": "the actual complaint"}}
+If the response is only timing/onset information, return: {{"complaint_name": null}}
+If unclear, return: {{"complaint_name": null}}
+
+Examples:
+- Q: "What brings you in?" A: "chest pain" → {{"complaint_name": "chest pain"}}
+- Q: "What brings you in?" A: "pain in my stomach" → {{"complaint_name": "pain in stomach"}}
+- Q: "What brings you in?" A: "yesterday" → {{"complaint_name": null}}
+- Q: "When did it start?" A: "yesterday" → {{"complaint_name": null}}
+- Q: "What brings you in?" A: "I have a headache since yesterday" → {{"complaint_name": "headache"}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{'role': 'user', 'content': extraction_prompt}],
+            temperature=0.1,
+            max_tokens=200
+        )
+        
+        extracted_text = response.choices[0].message.content.strip()
+        # Parse JSON
+        import json
+        # Remove markdown code blocks if present
+        if '```json' in extracted_text:
+            extracted_text = extracted_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in extracted_text:
+            extracted_text = extracted_text.split('```')[1].split('```')[0].strip()
+        
+        extracted_data = json.loads(extracted_text)
+        
+        complaint_name = extracted_data.get('complaint_name')
+        if complaint_name and complaint_name.lower() != 'null' and complaint_name.lower() != 'none':
+            update_session_data(session_id, {'complaint_name': complaint_name[:100]})
+            print(f"[LLM Extract] Set complaint_name: {complaint_name}")
+    except Exception as e:
+        print(f"[LLM Extract] Error extracting complaint name: {e}")
+
 def was_question_asked(session_id, new_question):
     """
     Check if a similar question was already asked.
@@ -579,8 +701,14 @@ def extract_and_store_data_with_llm(session_id, user_response, bot_question, con
     # ALWAYS store the Q&A pair first (even "no" responses)
     store_qa_pair(session_id, bot_question, user_response)
     
-    # Skip structured extraction for very short responses
-    if len(user_response.strip()) <= 3 or user_response.lower() in ['no', 'yes', 'nope', 'yeah', 'yep', 'nah']:
+    # Skip structured extraction for very short responses UNLESS it's the first response (complaint)
+    # Check if this is likely the first complaint response
+    session_data = get_or_create_session_data(session_id)
+    is_first_complaint = session_data and not session_data.get('complaint_name') and \
+                        any(phrase in bot_question.lower() for phrase in ['what brings you', 'main complaint', 'chief complaint', 'what is your complaint', 'what\'s wrong', 'what brings'])
+    
+    # Skip structured extraction for very short responses (unless it's the first complaint)
+    if not is_first_complaint and (len(user_response.strip()) <= 3 or user_response.lower() in ['no', 'yes', 'nope', 'yeah', 'yep', 'nah']):
         return
     
     session_data = get_or_create_session_data(session_id)
@@ -712,10 +840,27 @@ def extract_and_store_data(session_id, user_response, rag_question_info):
             updates['red_flags'] = red_flags
     
     # Also update complaint name if this is chief complaint
+    # Only set if not already set AND if response looks like an actual complaint (not timing/onset)
     if category and 'chief complaint' in category.lower():
         if not session_data.get('complaint_name'):
-            # Extract complaint from user response
-            updates['complaint_name'] = user_response[:100]  # Limit length
+            # Check if response is actually a complaint description vs timing/onset
+            # Timing words that shouldn't be saved as complaint_name
+            timing_words = ['yesterday', 'today', 'this morning', 'last week', '2 days ago', 
+                          '3 days ago', 'a week ago', 'recently', 'since', 'for']
+            response_lower = user_response.lower().strip()
+            
+            # If response is just a timing word, don't save as complaint_name
+            # Save it only if it contains complaint-related words or is longer than timing phrases
+            is_timing_only = any(timing_word in response_lower for timing_word in timing_words) and \
+                           len(response_lower.split()) <= 3 and \
+                           not any(word in response_lower for word in ['pain', 'ache', 'hurt', 'symptom', 'problem', 'issue', 'feeling', 'unwell'])
+            
+            if not is_timing_only:
+                # Extract complaint from user response
+                updates['complaint_name'] = user_response[:100]  # Limit length
+                print(f"[MongoDB] Set complaint_name: {user_response[:100]}")
+            else:
+                print(f"[MongoDB] Skipped setting complaint_name (looks like timing): {user_response}")
     
     if updates:
         update_session_data(session_id, updates)
@@ -792,7 +937,7 @@ def format_collected_data_for_llm(session_id):
     return ""
 
 # System prompt for HealthYoda
-SYSTEM_PROMPT = """You are HealthYODA, a medical intake voice agent.
+SYSTEM_PROMPT = """You are HealthYoda, a medical intake voice agent.
 Your role is to conduct an extensive, medically accurate patient interview to support Level 5 medical decision-making, by gathering a comprehensive history for the patient’s doctor.
 
 You must not give medical advice, diagnosis, interpretation, reassurance, or treatment of any kind.
@@ -883,9 +1028,11 @@ Social history (smoking, alcohol, occupational exposures)
 If the patient signals any high-risk symptoms, you must prioritize those questions immediately using the RAG checklist.
 
 Interview Behavior
+When starting a new conversation, first introduce yourself as HealthYoda, explain that you are a medical intake assistant here to collect information for their doctor, and then ask what brings them in today or what their main complaint is.
+
 Ask one question at a time (≤ 12 words).
 
-Adapt the next question based on the patient’s last answer.
+Adapt the next question based on the patient's last answer.
 
 Maintain empathy, clarity, and a professional tone.
 
@@ -986,6 +1133,118 @@ Never diagnose or treat.
 Summarize clearly at the end for the physician.
 """
 
+@app.route('/chat/greeting', methods=['POST'])
+def chat_greeting():
+    """Send initial greeting from bot following system prompt (streaming)"""
+    try:
+        # Ensure RAG system is initialized
+        if rag_system is None:
+            initialize_rag_system()
+        
+        if not client:
+            def error_response():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'OpenAI API key not configured'})}\n\n"
+            return Response(error_response(), mimetype='text/event-stream')
+        
+        data = request.get_json() or {}
+        session_id = data.get('session_id', 'default')
+        if not validate_session_id(session_id):
+            session_id = 'default'
+        
+        # Get or create conversation history
+        if session_id not in conversations:
+            conversations[session_id] = []
+        
+        conversation_history = conversations[session_id]
+        
+        # If conversation is empty, send initial greeting following system prompt
+        # Also check if there are any user messages (conversation has started)
+        has_user_messages = any(msg.get('role') == 'user' for msg in conversation_history)
+        
+        if len(conversation_history) == 0 and not has_user_messages:
+            # Prepare system prompt
+            enhanced_system_prompt = SYSTEM_PROMPT
+            
+            # Add context about already collected data
+            collected_data_context = format_collected_data_for_llm(session_id)
+            if collected_data_context:
+                enhanced_system_prompt += collected_data_context
+            
+            # Try to get initial question from RAG if available
+            rag_context = ""
+            if rag_system:
+                try:
+                    rag_question_info = rag_system.get_next_question(
+                        conversation_context="",
+                        current_category=None,
+                        symptom=None,
+                        system=None
+                    )
+                    if rag_question_info:
+                        rag_context = f"\n\n[RELEVANT QUESTION FROM QUESTION BOOK]\n"
+                        rag_context += f"Question: {rag_question_info['question']}\n"
+                        if rag_question_info.get('possible_answers'):
+                            rag_context += f"Possible answers: {', '.join(rag_question_info['possible_answers'][:5])}\n"
+                except Exception as e:
+                    print(f"[RAG] Error getting initial question: {e}")
+            
+            if rag_context:
+                enhanced_system_prompt += rag_context
+            
+            # Create messages with system prompt and a prompt to start the interview with introduction
+            messages = [
+                {'role': 'system', 'content': enhanced_system_prompt},
+                {'role': 'user', 'content': 'Introduce yourself as HealthYoda, explain that you are a medical intake assistant here to collect information for their doctor, and then ask what brings them in today or what their main complaint is.'}
+            ]
+            
+            def generate():
+                try:
+                    # Send thinking complete signal
+                    yield f"data: {json.dumps({'type': 'thinking_complete'})}\n\n"
+                    
+                    full_response = ""
+                    
+                    # Stream response from OpenAI
+                    stream = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        stream=True,
+                        temperature=0.7,
+                        max_tokens=1000
+                    )
+                    
+                    for chunk in stream:
+                        if chunk.choices[0].delta.content is not None:
+                            token = chunk.choices[0].delta.content
+                            full_response += token
+                            yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+                    
+                    # Add to conversation history (user message is hidden, only bot response shown)
+                    conversation_history.append({'role': 'user', 'content': 'Introduce yourself as HealthYoda, explain that you are a medical intake assistant here to collect information for their doctor, and then ask what brings them in today or what their main complaint is.'})
+                    conversation_history.append({'role': 'assistant', 'content': full_response})
+                    
+                    # Send done signal
+                    yield f"data: {json.dumps({'type': 'done', 'full_response': full_response})}\n\n"
+                    
+                except Exception as e:
+                    error_msg = f"Error generating greeting: {str(e)}"
+                    yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
+            
+            return Response(generate(), mimetype='text/event-stream')
+        else:
+            # Conversation already started, return empty
+            def empty_response():
+                yield f"data: {json.dumps({'type': 'done', 'full_response': ''})}\n\n"
+            return Response(empty_response(), mimetype='text/event-stream')
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to send greeting: {e}")
+        import traceback
+        traceback.print_exc()
+        def error_response():
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        return Response(error_response(), mimetype='text/event-stream')
+
 @app.route('/chat/stream', methods=['POST'])
 def chat_stream():
     """Streaming chat endpoint using OpenAI"""
@@ -1061,10 +1320,27 @@ def chat_stream():
                     prev_bot_question = conversation_history[i].get('content', '')
                     break
         
-        if prev_bot_question and len(question) > 2:  # Skip very short responses like "no"
+        # Always store the first user response (even if short) - this is the complaint
+        # Check if this is the first user message after greeting
+        is_first_user_response = len(conversation_history) == 3  # user (greeting prompt) + assistant (greeting) + user (this response)
+        
+        if prev_bot_question:
+            # Check if this is the first user message (after greeting) and extract complaint_name
+            # This is the actual complaint, not a follow-up answer
+            session_data = get_or_create_session_data(session_id)
+            if session_data and not session_data.get('complaint_name'):
+                # Check if the bot question was asking about the complaint
+                bot_q_lower = prev_bot_question.lower()
+                if any(phrase in bot_q_lower for phrase in ['what brings you', 'main complaint', 'chief complaint', 'what is your complaint', 'what\'s wrong', 'what brings']):
+                    # This is likely the actual complaint response
+                    # Use LLM to extract the complaint name intelligently
+                    extract_complaint_name(session_id, question, prev_bot_question)
+            
             # Use LLM to extract data from ANY response
-            recent_context = " ".join([msg.get('content', '') for msg in conversation_history[-6:]])
-            extract_and_store_data_with_llm(session_id, question, prev_bot_question, recent_context)
+            # For first response, always extract even if short (it's the complaint)
+            if is_first_user_response or len(question.strip()) > 2:
+                recent_context = " ".join([msg.get('content', '') for msg in conversation_history[-6:]])
+                extract_and_store_data_with_llm(session_id, question, prev_bot_question, recent_context)
         
         # Also use legacy RAG-based extraction if available
         if prev_rag_info:
@@ -1767,7 +2043,7 @@ def healthbench_dashboard():
         
         # Override CSP for dashboard to allow inline styles and scripts
         # Dashboard is internal tool, not patient-facing, so this is acceptable
-        response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
         
         return response
     
@@ -1888,10 +2164,10 @@ def index():
     </html>
     """
     
-    # Create response with modified CSP headers to allow inline styles
+    # Create response with modified CSP headers to allow inline styles and marked.js CDN
     from flask import make_response
     response = make_response(html_content)
-    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002"
     return response
 
 @app.route('/index.html', methods=['GET'])
@@ -1911,8 +2187,8 @@ def chatbot_interface():
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
         
-        # Allow inline styles and scripts for chatbot UI
-        response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002; img-src 'self' data: blob:; media-src 'self' blob:"
+        # Allow inline styles and scripts for chatbot UI, and marked.js CDN
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8002 http://localhost:8002; img-src 'self' data: blob:; media-src 'self' blob:"
         
         return response
     

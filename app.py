@@ -2255,5 +2255,9 @@ if __name__ == '__main__':
         print("-" * 50)
         app._startup_printed = True
     
-    app.run(host='127.0.0.1', port=8002, debug=False)
+    # Use 0.0.0.0 for Docker compatibility (allows external connections)
+    # In production, nginx handles external traffic
+    host = os.getenv('FLASK_HOST', '0.0.0.0')
+    port = int(os.getenv('FLASK_PORT', '8002'))
+    app.run(host=host, port=port, debug=False)
 

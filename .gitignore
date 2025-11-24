@@ -4,14 +4,22 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
 venv/
+env/
 ENV/
 .venv
 
 # Environment variables
 .env
-.env.local
+.env.*
+!env.template
 
 # IDE
 .vscode/
@@ -19,26 +27,51 @@ ENV/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
-desktop.ini
 
 # Logs
 *.log
+logs/
+
+# Database
+*.sqlite3
+*.db
+chroma_db/*.bin
+chroma_db/*.sqlite3
+
+# MongoDB data
+mongodb_data/
+
+# Docker
+docker-compose.override.yml
+
+# SSL certificates (if any)
+ssl/*.pem
+ssl/*.key
+ssl/*.crt
 
 # Temporary files
 *.tmp
 *.temp
+tmp/
+temp/
 
-# Audio files (HIPAA compliance - no audio storage)
-*.wav
-*.mp3
-*.webm
-*.ogg
-*.m4a
-*.flac
-audio_temp/
-temp_audio/
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Backups
+*.bak
+*.backup
+mongodb-backup-*

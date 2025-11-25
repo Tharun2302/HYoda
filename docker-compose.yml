@@ -10,8 +10,9 @@ services:
     ports:
       - "8002:8002"
     environment:
-      # OpenAI Configuration
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Ollama Configuration
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-alibayram/medgemma:4b}
       
       # Langfuse Configuration (Optional)
       - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-false}
@@ -23,12 +24,12 @@ services:
       - MONGODB_URI=${MONGODB_URI:-mongodb://mongodb:27017/}
       - MONGODB_DB=${MONGODB_DB:-healthyoda}
       
-      # HealthBench Configuration
-      - HEALTHBENCH_GRADER_MODEL=${HEALTHBENCH_GRADER_MODEL:-gpt-4o-mini}
-      - HELM_JUDGE_MODEL=${HELM_JUDGE_MODEL:-gpt-4o-mini}
+      # HealthBench Configuration (using Ollama models)
+      - HEALTHBENCH_GRADER_MODEL=${HEALTHBENCH_GRADER_MODEL:-alibayram/medgemma:4b}
+      - HELM_JUDGE_MODEL=${HELM_JUDGE_MODEL:-alibayram/medgemma:4b}
       
       # CORS Configuration
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://167.71.238.114:8002,http://localhost:8002,http://127.0.0.1:8002}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://68.183.88.5:8002,http://localhost:8002,http://127.0.0.1:8002}
       
       # Rate Limiting
       - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-100}
@@ -39,6 +40,9 @@ services:
       
       # Vector Store
       - REBUILD_VECTORSTORE=${REBUILD_VECTORSTORE:-false}
+    
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     
     volumes:
       - ./chroma_db:/app/chroma_db

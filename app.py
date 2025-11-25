@@ -8,10 +8,10 @@ import sys
 import re
 from pathlib import Path
 from datetime import datetime
-from openai import OpenAI
 from dotenv import load_dotenv
 from langfuse_tracker import langfuse_tracker
 from rag_system import QuestionBookRAG
+from ollama_client import get_ollama_client
 
 # MongoDB imports
 try:
@@ -87,24 +87,26 @@ def add_security_headers(response):
     
     return response
 
-# Initialize OpenAI client
-openai_api_key = os.getenv('OPENAI_API_KEY')
-if not openai_api_key:
-    print("WARNING: OPENAI_API_KEY environment variable not set!")
-    print("Please set it using: export OPENAI_API_KEY='your-api-key'")
-    print("Or create a .env file with OPENAI_API_KEY=your-api-key")
-    openai_api_key = None
+# Initialize Ollama client
+ollama_host = os.getenv('OLLAMA_HOST', 'http://host.docker.internal:11434')
+ollama_model = os.getenv('OLLAMA_MODEL', 'alibayram/medgemma:4b')
 
-if openai_api_key:
-    client = OpenAI(api_key=openai_api_key)
-else:
+try:
+    client = get_ollama_client(host=ollama_host, model=ollama_model)
+    if client.test_connection():
+        print(f"✅ Ollama client initialized: {ollama_model} at {ollama_host}")
+    else:
+        print(f"⚠️  Ollama connection failed. Check if Ollama is running at {ollama_host}")
+        client = None
+except Exception as e:
+    print(f"[ERROR] Failed to initialize Ollama client: {e}")
     client = None
 
 # Langfuse tracker is initialized in langfuse_tracker.py module
 # It will be None if LANGFUSE_ENABLED=false or if credentials are missing
 langfuse = langfuse_tracker.client
 
-# Initialize RAG system for Question Book with OpenAI client for embeddings
+# Initialize RAG system for Question Book with Ollama client for embeddings
 # Skip initialization in Flask reloader process (only initialize once in main process)
 rag_system = None
 live_evaluator = None
@@ -117,7 +119,7 @@ def initialize_rag_system():
     global rag_system
     if rag_system is None:
         try:
-            rag_system = QuestionBookRAG('docx/Question BOOK.docx', openai_client=client)
+            rag_system = QuestionBookRAG('docx/Question BOOK.docx', ollama_client=client)
             print(f"✅ RAG System loaded: {len(rag_system.questions)} questions available")
             if rag_system.collection is not None:
                 try:
@@ -144,9 +146,9 @@ def initialize_evaluation_system():
     
     if live_evaluator is None:
         try:
-            # Get grader model from environment or use default
-            grader_model = os.getenv('HEALTHBENCH_GRADER_MODEL', 'gpt-4o-mini')
-            helm_judge_model = os.getenv('HELM_JUDGE_MODEL', 'gpt-4o-mini')
+            # Get grader model from environment or use default (Ollama model)
+            grader_model = os.getenv('HEALTHBENCH_GRADER_MODEL', 'alibayram/medgemma:4b')
+            helm_judge_model = os.getenv('HELM_JUDGE_MODEL', 'alibayram/medgemma:4b')
             
             # Initialize HealthBench evaluator
             live_evaluator = get_live_evaluator(grader_model=grader_model)
@@ -577,9 +579,9 @@ Examples:
 """
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = client.chat_completions_create(
             messages=[{'role': 'user', 'content': extraction_prompt}],
+            stream=False,
             temperature=0.1,
             max_tokens=200
         )
@@ -636,9 +638,9 @@ Examples:
 """
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = client.chat_completions_create(
             messages=[{'role': 'user', 'content': extraction_prompt}],
+            stream=False,
             temperature=0.1,
             max_tokens=200
         )
@@ -695,7 +697,7 @@ def extract_and_store_data_with_llm(session_id, user_response, bot_question, con
     Store question-answer pair AND extract structured data.
     Stores ALL responses including "no".
     """
-    if not client:  # No OpenAI client
+    if not client:  # No Ollama client
         return
     
     # ALWAYS store the Q&A pair first (even "no" responses)
@@ -733,9 +735,9 @@ Return JSON with dynamic field names. If no meaningful data, return: {{}}
 """
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = client.chat_completions_create(
             messages=[{'role': 'user', 'content': extraction_prompt}],
+            stream=False,
             temperature=0.1,
             max_tokens=500
         )
@@ -1143,7 +1145,7 @@ def chat_greeting():
         
         if not client:
             def error_response():
-                yield f"data: {json.dumps({'type': 'error', 'error': 'OpenAI API key not configured'})}\n\n"
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Ollama client not initialized'})}\n\n"
             return Response(error_response(), mimetype='text/event-stream')
         
         data = request.get_json() or {}
@@ -1204,9 +1206,8 @@ def chat_greeting():
                     
                     full_response = ""
                     
-                    # Stream response from OpenAI
-                    stream = client.chat.completions.create(
-                        model="gpt-4o-mini",
+                    # Stream response from Ollama
+                    stream = client.chat_completions_create(
                         messages=messages,
                         stream=True,
                         temperature=0.7,
@@ -1247,7 +1248,7 @@ def chat_greeting():
 
 @app.route('/chat/stream', methods=['POST'])
 def chat_stream():
-    """Streaming chat endpoint using OpenAI"""
+    """Streaming chat endpoint using Ollama"""
     try:
         # HIPAA Compliance: Rate limiting
         client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
@@ -1261,7 +1262,7 @@ def chat_stream():
             initialize_rag_system()
         
         if not client:
-            error_msg = "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+            error_msg = "Ollama client not initialized. Please ensure Ollama is running and accessible."
             def error_response():
                 yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
             return Response(error_response(), mimetype='text/event-stream')
@@ -1386,7 +1387,7 @@ def chat_stream():
                     print(f"[RAG] Question: {rag_question_info['question']}")
                     print(f"{'='*80}\n")
         
-        # Prepare messages for OpenAI (include system prompt + RAG context + collected data)
+        # Prepare messages for Ollama (include system prompt + RAG context + collected data)
         enhanced_system_prompt = SYSTEM_PROMPT
         
         # Add context about already collected data (so LLM doesn't ask again)
@@ -1449,9 +1450,8 @@ def chat_stream():
                 
                 full_response = ""
                 
-                # Stream response from OpenAI
-                stream = client.chat.completions.create(
-                    model="gpt-4o-mini",  # Using GPT-4o mini model
+                # Stream response from Ollama
+                stream = client.chat_completions_create(
                     messages=messages,
                     stream=True,
                     temperature=0.7,
@@ -1655,7 +1655,7 @@ def chat_stream():
                 yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'trace_id': final_trace_id, 'generation_id': generation_id, 'tree_branch_info': tree_branch_info})}\n\n"
                 
             except Exception as e:
-                error_msg = f"Error calling OpenAI API: {str(e)}"
+                error_msg = f"Error calling Ollama API: {str(e)}"
                 
                 # Log error to Langfuse if configured
                 if langfuse and generation:
@@ -2207,13 +2207,12 @@ if __name__ == '__main__':
         print("Server will run on http://127.0.0.1:8002")
         print("-" * 50)
         
-        if not openai_api_key:
-            print("\n[WARNING] OPENAI_API_KEY not set!")
-            print("Set it using: export OPENAI_API_KEY='your-api-key'")
-            print("Or create a .env file with OPENAI_API_KEY=your-api-key")
-            print("The chatbot will not work without an API key.\n")
+        if not client:
+            print("\n[WARNING] Ollama client not initialized!")
+            print("Please ensure Ollama is installed and running")
+            print("The chatbot will not work without Ollama.\n")
         else:
-            print("[OK] OpenAI API key found!")
+            print(f"[OK] Ollama client initialized with model: {ollama_model}")
         
         if not langfuse:
             print("[WARNING] Langfuse keys not found. Traces will not be logged.")

@@ -7,9 +7,13 @@ without complex dependencies.
 import os
 import json
 import time
+import sys
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from openai import OpenAI
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ollama_client import get_ollama_client
 
 
 @dataclass
@@ -133,12 +137,12 @@ class SimpleLiveEvaluator:
         }
     ]
     
-    def __init__(self, grader_model: str = "gpt-4o-mini", enabled: bool = True):
+    def __init__(self, grader_model: str = "alibayram/medgemma:4b", enabled: bool = True):
         """
         Initialize the evaluator
         
         Args:
-            grader_model: Model to use for grading
+            grader_model: Ollama model to use for grading
             enabled: Whether evaluation is enabled
         """
         self.enabled = enabled
@@ -147,14 +151,15 @@ class SimpleLiveEvaluator:
         
         if self.enabled:
             try:
-                api_key = os.getenv('OPENAI_API_KEY')
-                if not api_key:
-                    print("[EVALUATOR] OPENAI_API_KEY not found, disabling evaluation")
+                ollama_host = os.getenv('OLLAMA_HOST', 'http://host.docker.internal:11434')
+                self.client = get_ollama_client(host=ollama_host, model=grader_model)
+                
+                if not self.client.test_connection():
+                    print("[EVALUATOR] Ollama not accessible, disabling evaluation")
                     self.enabled = False
                     return
                 
-                self.client = OpenAI(api_key=api_key)
-                print(f"[EVALUATOR] ✅ Initialized with {grader_model}")
+                print(f"[EVALUATOR] ✅ Initialized with Ollama model: {grader_model}")
                 
             except Exception as e:
                 print(f"[EVALUATOR] Failed to initialize: {e}")
@@ -292,9 +297,9 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
 """
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.grader_model,
+            response = self.client.chat_completions_create(
                 messages=[{'role': 'user', 'content': prompt}],
+                stream=False,
                 max_tokens=200,
                 temperature=0.0
             )
@@ -484,7 +489,7 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
 _evaluator_instance = None
 
 
-def get_live_evaluator(grader_model: str = "gpt-4o-mini") -> SimpleLiveEvaluator:
+def get_live_evaluator(grader_model: str = "alibayram/medgemma:4b") -> SimpleLiveEvaluator:
     """Get or create evaluator instance"""
     global _evaluator_instance
     

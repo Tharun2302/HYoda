@@ -74,11 +74,10 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# Check if OPENAI_API_KEY is set
-if ! grep -q "OPENAI_API_KEY=sk-" .env; then
-    echo -e "${RED}ERROR: OPENAI_API_KEY not configured in .env${NC}"
-    echo -e "${YELLOW}Please add your OpenAI API key to .env file${NC}"
-    exit 1
+# Check if OLLAMA_HOST is set (Ollama doesn't need API keys, just host URL)
+if ! grep -q "OLLAMA_HOST=" .env; then
+    echo -e "${YELLOW}Warning: OLLAMA_HOST not configured in .env${NC}"
+    echo -e "${YELLOW}Using default: http://host.docker.internal:11434${NC}"
 fi
 
 echo -e "${GREEN}✓ Environment file found${NC}"

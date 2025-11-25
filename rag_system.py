@@ -17,11 +17,11 @@ except ImportError:
 class QuestionBookRAG:
     """RAG system for retrieving relevant questions from the Question Book"""
     
-    def __init__(self, docx_path: str = 'docx/Question BOOK.docx', openai_client=None):
+    def __init__(self, docx_path: str = 'docx/Question BOOK.docx', ollama_client=None):
         self.docx_path = docx_path
         self.questions = []
         self.sections = []
-        self.openai_client = openai_client
+        self.ollama_client = ollama_client
         
         # Initialize ChromaDB for vector storage (if available)
         self.chroma_client = None
@@ -201,8 +201,8 @@ class QuestionBookRAG:
             print("[WARNING] Vector database not available - skipping embeddings. Using keyword search only.")
             return
             
-        if not self.openai_client:
-            print("[WARNING] OpenAI client not available - skipping embeddings. Using keyword search only.")
+        if not self.ollama_client:
+            print("[WARNING] Ollama client not available - skipping embeddings. Using keyword search only.")
             return
         
         # Check if collection already has data (unless force rebuild)
@@ -261,13 +261,14 @@ class QuestionBookRAG:
             batch_metadatas = metadatas[i:i+batch_size]
             
             try:
-                # Get embeddings from OpenAI
-                response = self.openai_client.embeddings.create(
-                    model="text-embedding-3-small",  # Cost-effective embedding model
-                    input=batch_texts
-                )
-                
-                embeddings = [item.embedding for item in response.data]
+                # Get embeddings from Ollama (one at a time for now)
+                embeddings = []
+                for text in batch_texts:
+                    response = self.ollama_client.embeddings_create(
+                        input_text=text,
+                        model="nomic-embed-text"  # Default Ollama embedding model
+                    )
+                    embeddings.append(response.data[0].embedding)
                 
                 # Add to ChromaDB
                 self.collection.add(
@@ -322,12 +323,12 @@ class QuestionBookRAG:
         Returns question with tags and tree_path for logging
         """
         # Try semantic search first if embeddings are available
-        if use_semantic_search and self.openai_client and self.collection and self.collection.count() > 0:
+        if use_semantic_search and self.ollama_client and self.collection and self.collection.count() > 0:
             try:
                 # Create embedding for the conversation context
-                response = self.openai_client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=conversation_context
+                response = self.ollama_client.embeddings_create(
+                    input_text=conversation_context,
+                    model="nomic-embed-text"
                 )
                 query_embedding = response.data[0].embedding
                 
